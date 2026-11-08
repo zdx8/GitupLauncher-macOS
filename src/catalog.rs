@@ -192,33 +192,70 @@ pub fn is_builtin(slug: &str) -> bool {
     BUILTIN.iter().any(|r| r.slug == slug)
 }
 
+/// Everything a pasted repository address can be reduced to `owner/repo`:
+/// a full URL, a clone URL, a URL with a deeper path such as `/releases`,
+/// trailing slashes, a `.git` suffix, query strings.
+fn reduce_to_slug(input: &str) -> String {
+    let mut s = input.trim().to_string();
+    for lead in [
+        "https://www.github.com/",
+        "http://www.github.com/",
+        "https://github.com/",
+        "http://github.com/",
+        "https://gitee.com/",
+        "git@github.com:",
+        "github.com/",
+    ] {
+        if let Some(rest) = s.strip_prefix(lead) {
+            s = rest.to_string();
+            break;
+        }
+    }
+    // A pasted address may carry a query or a fragment.
+    let cut = s
+        .char_indices()
+        .find(|(_, c)| *c == '?' || *c == '#')
+        .map(|(i, _)| i);
+    if let Some(i) = cut {
+        s.truncate(i);
+    }
+    s = s.trim().trim_end_matches('/').to_string();
+    if let Some(rest) = s.strip_suffix(".git") {
+        s = rest.trim_end_matches('/').to_string();
+    }
+    // A deeper path (`/tree/main`, `/releases`, `/issues`) is dropped: the
+    // first two pieces are the repository itself.
+    let parts: Vec<&str> = s.split('/').filter(|p| !p.trim().is_empty()).collect();
+    if parts.len() >= 2 {
+        format!("{}/{}", parts[0].trim(), parts[1].trim())
+    } else {
+        s
+    }
+}
+
 /// Check that something typed in looks like `owner/repo` and is not
 /// already being managed.
 fn check_new_slug(slug: &str) -> Result<String, String> {
-    let slug = slug.trim().trim_end_matches('/');
-    if slug.is_empty() {
+    if slug.trim().is_empty() {
         return Err("请输入仓库地址，格式如 owner/repo".to_string());
     }
-    let mut parts = slug.splitn(2, '/');
-    let (owner, repo) = (
-        parts.next().unwrap_or(""),
-        parts.next().unwrap_or(""),
-    );
-    let ok_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/');
-    if owner.is_empty()
-        || repo.is_empty()
-        || !slug.chars().all(ok_char)
-        || slug.contains("//")
+    let slug = reduce_to_slug(slug);
+    let Some((owner, repo)) = slug.split_once('/') else {
+        return Err("仓库地址应为 owner/repo 或 GitHub 链接".to_string());
+    };
+    let ok_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    if owner.is_empty() || repo.is_empty() || repo.contains('/')
+        || !owner.chars().all(ok_char) || !repo.chars().all(ok_char)
     {
-        return Err("仓库地址应为 owner/repo，只能包含字母、数字、- _ .".to_string());
+        return Err("仓库地址应为 owner/repo 或 GitHub 链接".to_string());
     }
     if repos()
         .iter()
-        .any(|r| r.slug.eq_ignore_ascii_case(slug))
+        .any(|r| r.slug.eq_ignore_ascii_case(&slug))
     {
         return Err("该仓库已经在订阅列表中".to_string());
     }
-    Ok(slug.to_string())
+    Ok(slug)
 }
 
 /// Add a repository the person typed in. Its card is built by the same

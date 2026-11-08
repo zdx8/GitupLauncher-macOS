@@ -40,6 +40,54 @@ pub struct MacAsset {
     pub kind: AssetKind,
 }
 
+/// The release as plain JSON, so it can be kept on disk and shown again
+/// when GitHub cannot be asked (the anonymous API allows sixty calls an
+/// hour, and a launcher that loses its version numbers when that runs out
+/// is no use).
+pub fn to_json(rel: &ReleaseInfo) -> Value {
+    let asset = rel.asset.as_ref().map(|a| {
+        serde_json::json!({
+            "name": a.name,
+            "url": a.url,
+            "size": a.size,
+            "kind": match a.kind {
+                AssetKind::Zip => "zip",
+                AssetKind::Dmg => "dmg",
+            },
+        })
+    });
+    serde_json::json!({
+        "tag": rel.tag,
+        "published": rel.published,
+        "html_url": rel.html_url,
+        "body": rel.body,
+        "asset": asset,
+    })
+}
+
+/// Read one back off the cache.
+pub fn from_json(v: &Value) -> Option<ReleaseInfo> {
+    let tag = v["tag"].as_str()?.to_string();
+    let asset = v.get("asset").and_then(|a| {
+        Some(MacAsset {
+            name: a["name"].as_str()?.to_string(),
+            url: a["url"].as_str()?.to_string(),
+            size: a["size"].as_u64().unwrap_or(0),
+            kind: match a["kind"].as_str() {
+                Some("dmg") => AssetKind::Dmg,
+                _ => AssetKind::Zip,
+            },
+        })
+    });
+    Some(ReleaseInfo {
+        tag,
+        published: v["published"].as_str().unwrap_or("").to_string(),
+        html_url: v["html_url"].as_str().unwrap_or("").to_string(),
+        body: v["body"].as_str().unwrap_or("").to_string(),
+        asset,
+    })
+}
+
 /// What a repository's newest usable release looks like.
 #[derive(Clone)]
 pub struct ReleaseInfo {

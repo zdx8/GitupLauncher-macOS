@@ -55,6 +55,9 @@ const COLUMNS: usize = 3;
 const MARGIN: f32 = 20.0;
 /// The side margin of the detail page.
 const DETAIL_MARGIN: f32 = 20.0;
+/// How much room the detail page keeps clear on its right, so its own
+/// scrollbar never sits on a button.
+const RIGHT_GUTTER: f32 = 34.0;
 
 /// Which of the other screens to show when the window opens.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,6 +69,7 @@ enum Demo {
     Search,
     Detail,
     Settings,
+    Hover,
 }
 
 /// What the window is showing: the grid, one app's page, or settings.
@@ -113,6 +117,13 @@ struct Launcher {
     /// Each repository's own description, kept on disk so the API is
     /// asked at most once per repository.
     descriptions: std::collections::BTreeMap<String, String>,
+    /// The last release read for each repository, kept on disk. It is what
+    /// the cards show while the network is still answering, and what they
+    /// fall back to when GitHub refuses to answer at all.
+    releases: std::collections::BTreeMap<String, serde_json::Value>,
+    /// A card to draw as though the pointer were over it. Only set by the
+    /// hover demo, so the accent frame can be checked in a picture.
+    hover_demo: Option<usize>,
 }
 
 impl Launcher {
@@ -157,9 +168,16 @@ impl Launcher {
             settings,
             settings_input: String::new(),
             descriptions: load_descriptions(),
+            releases: load_releases(),
+            hover_demo: None,
         };
         for (i, repo) in repos().iter().enumerate() {
             launcher.state.subscribed[i] = !launcher.settings.disabled.iter().any(|d| d == repo.id);
+            // What was read last time is shown at once, so the versions and
+            // dates are never blank while — or if — GitHub stays silent.
+            if let Some(rel) = launcher.releases.get(repo.slug).and_then(github::from_json) {
+                launcher.state.repos[i].fetch = FetchState::Done(Ok(rel));
+            }
         }
         if launcher.settings.auto_check {
             launcher.spawn_meta_fetch_all();
@@ -452,7 +470,29 @@ impl Launcher {
             let idx_ok = |idx: usize, repos: &Vec<state::RepoState>| idx < repos.len();
             match msg {
                 Msg::Meta { idx, result } if idx_ok(idx, &self.state.repos) => {
-                    self.state.apply_meta(idx, result)
+                    let slug = repos()[idx].slug.to_string();
+                    match result {
+                        Ok(rel) => {
+                            // Fresh from GitHub: keep it, so the next run
+                            // and any rate-limited spell can use it.
+                            self.releases
+                                .insert(slug, github::to_json(&rel));
+                            save_releases(&self.releases);
+                            self.state.apply_meta(idx, Ok(rel));
+                        }
+                        Err(e) => match self
+                            .releases
+                            .get(&slug)
+                            .and_then(github::from_json)
+                        {
+                            Some(rel) => {
+                                self.state.apply_meta(idx, Ok(rel));
+                                self.state.status =
+                                    "GitHub 暂时无法访问，显示的是上次读取的版本信息".to_string();
+                            }
+                            None => self.state.apply_meta(idx, Err(e)),
+                        },
+                    }
                 }
                 Msg::Progress { idx, done, total } if idx_ok(idx, &self.state.repos) => {
                     self.state.apply_progress(idx, done, total)
@@ -686,6 +726,9 @@ impl eframe::App for App {
             Demo::Detail => self.launcher.open_page(0),
             // The settings page, to look at it too.
             Demo::Settings => self.launcher.page = Page::Settings,
+            // A card held under the pointer, so the hover frame can be
+            // looked at without a mouse.
+            Demo::Hover => self.launcher.hover_demo = Some(0),
             Demo::None => {}
         }
 
@@ -819,7 +862,15 @@ impl Launcher {
         let _ = idx;
         let nav_end = rect.max.x - 56.0;
         let size = 28.0;
-        for (which, x) in [(2, nav_end - size), (1, nav_end - 40.0), (0, nav_end - 80.0)] {
+        // Cells sit side by side with an eight-point gap; the close cell's
+        // right edge is the far end of the cluster.
+        let step = size + 8.0;
+        let close_x = nav_end - size;
+        for (which, x) in [
+            (2, close_x),
+            (1, close_x - step),
+            (0, close_x - 2.0 * step),
+        ] {
             self.draw_nav_cell(ui, which, x, mid, p, size);
         }
     }
@@ -917,8 +968,10 @@ impl Launcher {
         // the window is made.
         let right = rect.max.x - MARGIN;
 
-        // The view switch: two cells, the chosen one filled.
-        let toggle_w = 68.0;
+        // The view switch: two cells, the chosen one filled. The cells are
+        // a little wider than a bare tap target so the marks inside can be
+        // drawn large.
+        let toggle_w = 78.0;
         let toggle_h = 33.0;
         let toggle =
             Rect::from_min_max(pos2(right - toggle_w, 66.0), pos2(right, 66.0 + toggle_h));
@@ -934,7 +987,7 @@ impl Launcher {
             .rect_stroke(toggle, 0, line(p.border), StrokeKind::Middle);
         grid_icon(
             ui.painter(),
-            Rect::from_center_size(grid_rect.center(), vec2(15.0, 15.0)),
+            Rect::from_center_size(grid_rect.center(), vec2(19.0, 19.0)),
             if self.state.layout == View::Grid {
                 p.bg
             } else {
@@ -943,7 +996,7 @@ impl Launcher {
         );
         list_icon(
             ui.painter(),
-            Rect::from_center_size(list_rect.center(), vec2(15.0, 15.0)),
+            Rect::from_center_size(list_rect.center(), vec2(19.0, 19.0)),
             if self.state.layout == View::List {
                 p.bg
             } else {
@@ -970,18 +1023,20 @@ impl Launcher {
             .rect_filled(search_rect, 0, p.search_fill);
         ui.painter()
             .rect_stroke(search_rect, 0, line(p.border), StrokeKind::Middle);
-        // The hint sits square in the middle of the box, drawn by hand:
-        // the field's own hint can only hug the left edge.
+        // The hint sits at the left edge, on the box's middle line: the
+        // field's own hint would do the same, but drawing it keeps the
+        // spacing exact.
         if self.search.is_empty() {
             ui.painter().text(
-                search_rect.center(),
-                Align2::CENTER_CENTER,
+                pos2(search_rect.min.x + 12.0, search_rect.center().y),
+                Align2::LEFT_CENTER,
                 "搜索应用",
                 text(13.0),
                 p.muted,
             );
         }
         let edit = TextEdit::singleline(&mut self.search)
+            .id(egui::Id::unique("toolbar-search"))
             .text_color(p.text)
             .frame(egui::Frame::NONE)
             .desired_width(search_rect.width() - 16.0);
@@ -1194,7 +1249,7 @@ impl Launcher {
     /// way the original draws it. The columns share whatever width the
     /// window has, and the whole thing rides the scroll offset.
     fn grid(&mut self, ui: &mut Ui, band: Rect, apps: &[usize], p: &Palette) {
-        let col_w = (band.width() - 2.0 * MARGIN) / COLUMNS as f32;
+        let col_w = (band.width() - MARGIN - RIGHT_GUTTER) / COLUMNS as f32;
         let scroll = self.state.scroll;
 
         let mut row_top = band.min.y - scroll;
@@ -1235,6 +1290,25 @@ impl Launcher {
         let painter = &clip;
 
         let app = &repos()[idx];
+        // The whole card is one click target: anywhere inside it opens the
+        // app's page. The small links and buttons inside are registered
+        // after it, so they still win the click where they sit. While the
+        // pointer is over the card its frame takes the accent colour.
+        let mut hovered = false;
+        if vis.is_positive() {
+            let resp = ui.interact(
+                vis,
+                ui.scope_id().with(("card", app.id)),
+                Sense::click(),
+            );
+            hovered = resp.hovered() || self.hover_demo == Some(idx);
+            if hovered {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                self.open_page(idx);
+            }
+        }
         // Everything read off the state is copied out up front, so the
         // borrows are done before anything calls back into it.
         let installed = self.state.is_installed(idx);
@@ -1253,11 +1327,27 @@ impl Launcher {
                 format!("V{}", version::clean_tag(&rel.tag).to_uppercase()),
                 version::fmt_date(&rel.published),
             ),
-            FetchState::Done(Err(_)) => ("—".to_string(), "未知".to_string()),
+            // Nothing came back: say what is on this Mac rather than
+            // leaving the card blank.
+            FetchState::Done(Err(_)) => match &self.state.repos[idx].installed {
+                Some(v) => (format!("V{}", v.to_uppercase()), "未获取到".to_string()),
+                None => ("—".to_string(), "未获取到".to_string()),
+            },
         };
 
-        // The card's frame.
-        painter.rect_stroke(card, 0, line(p.border), StrokeKind::Middle);
+        // The card's frame. On hover it is tinted and outlined in the
+        // accent colour, so the pointer's target is obvious.
+        if hovered {
+            painter.rect_filled(card, 0, p.surface);
+            painter.rect_stroke(
+                card,
+                0,
+                Stroke::new(1.5, p.accent),
+                StrokeKind::Middle,
+            );
+        } else {
+            painter.rect_stroke(card, 0, line(p.border), StrokeKind::Middle);
+        }
 
         // The header strip: the version on the left, a link on the right.
         let header = Rect::from_min_max(card.min, pos2(card.max.x, card.min.y + CARD_HEAD_H));
@@ -1338,21 +1428,33 @@ impl Launcher {
             p.text,
         );
 
-        // The badge that says who publishes it.
-        let badge_text = format!("由 {} 提供", catalog::owner_of(app.slug).to_uppercase());
-        let badge_w = measure(ui, &badge_text, label(11.0)) + 24.0;
-        let badge = Rect::from_min_size(
-            pos2(text_x + name_w + 14.0, name_y - 11.0),
-            vec2(badge_w, 22.0),
-        );
-        painter.rect_stroke(badge, 0, line(p.border), StrokeKind::Middle);
-        painter.text(
-            pos2(badge.center().x, badge.center().y),
-            Align2::CENTER_CENTER,
-            &badge_text,
-            label(11.0),
-            p.accent,
-        );
+        // The badge that says who publishes it. A long owner name would
+        // run past the card's rule, so it is shortened, then dropped, when
+        // there is no room beside the app's name.
+        let owner = catalog::owner_of(app.slug).to_uppercase();
+        let badge_x = text_x + name_w + 14.0;
+        let room = card.max.x - 16.0 - badge_x;
+        for (word, size) in [
+            (format!("由 {owner} 提供"), 11.0),
+            (format!("由 {owner}"), 10.0),
+        ] {
+            let badge_w = measure(ui, &word, label(size)) + 22.0;
+            if badge_w <= room {
+                let badge = Rect::from_min_size(
+                    pos2(badge_x, name_y - 11.0),
+                    vec2(badge_w, 22.0),
+                );
+                painter.rect_stroke(badge, 0, line(p.border), StrokeKind::Middle);
+                painter.text(
+                    pos2(badge.center().x, badge.center().y),
+                    Align2::CENTER_CENTER,
+                    &word,
+                    label(size),
+                    p.accent,
+                );
+                break;
+            }
+        }
 
         // The Chinese one-liner, under the name.
         painter.text(
@@ -1365,7 +1467,9 @@ impl Launcher {
 
         // The English description, on the left below the tile.
         let desc_y = header.max.y + TILE + 46.0;
-        let wrap_w = card.width() - 20.0;
+        // Text starts twenty points in and stops twenty short, so no line
+        // ever runs into the card's rule.
+        let wrap_w = card.width() - 40.0;
         let summary = self.summary_text(idx);
         let galley = painter.layout(summary, text(14.0), p.muted, wrap_w);
         let galley_h = galley.size().y;
@@ -1816,7 +1920,11 @@ impl Launcher {
             text(11.5),
             p.faint,
         );
-        ry += 14.0;
+        // A rule and some air between the two sections, so the folder's
+        // fine print never runs into the subscriptions heading.
+        ry += 26.0;
+        painter.hline(right_x..=right_x + col_w, ry, line(p.border));
+        ry += 32.0;
 
         // ------------------------------------- right: managed subscriptions
         painter.text(
@@ -1863,9 +1971,9 @@ impl Launcher {
                 );
             }
             let custom = !catalog::is_builtin(repo.slug);
-            // A repository the person added gets a little cross at the end
-            // of its row that removes it altogether.
-            let name_w = sub_cell_w - 26.0 - if custom { 18.0 } else { 0.0 };
+            // A repository the person added gets a little outlined cross at
+            // the end of its row that removes it altogether. It is drawn as
+            // a proper button, so it reads as one.
             painter.text(
                 pos2(box_r.max.x + 8.0, box_r.center().y),
                 Align2::LEFT_CENTER,
@@ -1873,14 +1981,24 @@ impl Launcher {
                 text(13.0),
                 if checked { p.text } else { p.faint },
             );
-            let _ = name_w;
             if custom {
-                let cx = Rect::from_min_size(
-                    pos2(x + sub_cell_w - 20.0, yy - 10.0),
-                    vec2(18.0, 18.0),
+                let name_w = measure(ui, repo.name, text(13.0));
+                let cx_x = (box_r.max.x + 8.0 + name_w + 8.0)
+                    .min(x + sub_cell_w - 22.0);
+                let cx = Rect::from_min_size(pos2(cx_x, yy - 10.0), vec2(20.0, 20.0));
+                let hovered = cx.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()));
+                painter.rect_stroke(
+                    cx,
+                    radius(4),
+                    if hovered {
+                        Stroke::new(1.0, p.amber)
+                    } else {
+                        line(p.border)
+                    },
+                    StrokeKind::Middle,
                 );
                 let c = cx.center();
-                let st = Stroke::new(1.4, p.faint);
+                let st = Stroke::new(1.4, if hovered { p.amber } else { p.muted });
                 painter.line_segment(
                     [egui::pos2(c.x - 4.0, c.y - 4.0), egui::pos2(c.x + 4.0, c.y + 4.0)],
                     st,
@@ -1889,7 +2007,7 @@ impl Launcher {
                     [egui::pos2(c.x + 4.0, c.y - 4.0), egui::pos2(c.x - 4.0, c.y + 4.0)],
                     st,
                 );
-                let hit = cx.intersect(band);
+                let hit = cx.intersect(band).expand(3.0);
                 if hit.is_positive() {
                     let resp = ui.interact(
                         hit,
@@ -1917,37 +2035,60 @@ impl Launcher {
             }
         }
         let sub_rows = list.len().div_ceil(sub_cols) as f32;
-        ry += sub_rows * 26.0 + 16.0;
+        ry += sub_rows * 26.0 + 22.0;
 
-        // The add box: a slug goes in, the same rules take over from there.
+        // The add box: a link or a slug goes in, the same rules take over
+        // from there. The field has a fixed id so it keeps its focus (and
+        // therefore keeps working for typing and pasting) across frames,
+        // and a click anywhere on the box puts the caret in it.
         let add_w = col_w - 72.0;
-        let add_box = Rect::from_min_size(pos2(right_x, ry), vec2(add_w, 30.0));
+        let add_box = Rect::from_min_size(pos2(right_x, ry), vec2(add_w, 32.0));
         painter.rect_filled(add_box, 0, p.search_fill);
-        painter.rect_stroke(add_box, 0, line(p.border), StrokeKind::Middle);
+        let field_id = egui::Id::unique("settings-add-field");
+        let field_focused = ui.memory(|m| m.has_focus(field_id));
+        painter.rect_stroke(
+            add_box,
+            0,
+            if field_focused {
+                Stroke::new(1.0, p.accent)
+            } else {
+                line(p.border)
+            },
+            StrokeKind::Middle,
+        );
         if self.settings_input.is_empty() {
             painter.text(
                 pos2(add_box.min.x + 10.0, add_box.center().y),
                 Align2::LEFT_CENTER,
-                "owner/repo，如 zdx8/Foo-macOS",
+                "粘贴仓库链接，或填写 owner/repo",
                 text(12.0),
                 p.faint,
             );
         }
         let mut child = ui.new_child(
-            egui::UiBuilder::new().max_rect(Rect::from_min_max(
-                pos2(add_box.min.x + 8.0, add_box.min.y),
-                pos2(add_box.max.x - 8.0, add_box.max.y),
-            )),
+            egui::UiBuilder::new()
+                .max_rect(Rect::from_min_max(
+                    pos2(add_box.min.x + 8.0, add_box.min.y + 1.0),
+                    pos2(add_box.max.x - 8.0, add_box.max.y - 1.0),
+                ))
+                .id_salt("settings-add-field-ui"),
         );
-        child.add(
+        child.add_sized(
+            vec2(add_box.width() - 16.0, 28.0),
             TextEdit::singleline(&mut self.settings_input)
+                .id(field_id)
                 .text_color(p.text)
                 .frame(egui::Frame::NONE)
                 .desired_width(add_box.width() - 16.0),
         );
+        if ui.rect_contains_pointer(add_box)
+            && ui.input(|i| i.pointer.primary_pressed())
+        {
+            ui.memory_mut(|m| m.request_focus(field_id));
+        }
         let add_btn = Rect::from_min_size(
             pos2(add_box.max.x + 8.0, ry),
-            vec2(64.0, 30.0),
+            vec2(64.0, 32.0),
         );
         painter.rect_stroke(add_btn, 0, line(p.border), StrokeKind::Middle);
         painter.text(
@@ -1975,7 +2116,7 @@ impl Launcher {
         painter.text(
             pos2(right_x, ry),
             Align2::LEFT_CENTER,
-            "添加后自动拉取最新发布、查找本机已装版本并加载图标。",
+            "支持完整的 GitHub 链接；添加后自动拉取发布、查找本机版本并加载图标。",
             text(11.5),
             p.faint,
         );
@@ -2024,7 +2165,7 @@ impl Launcher {
         let painter = ui.painter().with_clip_rect(band);
         let row_h = 52.0;
         let head_h = 36.0;
-        let right = band.max.x - MARGIN;
+        let right = band.max.x - RIGHT_GUTTER;
         // The right-hand column edges, working leftward from the window's
         // right edge: the little menu, the action button, then the author,
         // the date, the version and the status pill.
@@ -2071,7 +2212,7 @@ impl Launcher {
             }
             let row = Rect::from_min_size(
                 pos2(band.min.x + MARGIN, y),
-                vec2(band.width() - 2.0 * MARGIN, row_h),
+                vec2(band.width() - MARGIN - RIGHT_GUTTER, row_h),
             );
             let vis = row.intersect(band);
             let clip = ui.painter().with_clip_rect(vis);
@@ -2158,10 +2299,11 @@ impl Launcher {
                 text(13.0),
                 p.muted,
             );
+            let author = catalog::owner_of(app.slug).to_uppercase();
             clip.text(
                 pos2(author_r, row.center().y),
                 Align2::RIGHT_CENTER,
-                catalog::owner_of(app.slug).to_uppercase(),
+                fit_text(ui, &author, text(13.0), 86.0),
                 text(13.0),
                 p.muted,
             );
@@ -2265,7 +2407,8 @@ impl Launcher {
     ) -> f32 {
         let app = &repos()[idx];
         let painter = ui.painter().with_clip_rect(band);
-        let w = band.width() - 2.0 * DETAIL_MARGIN;
+        // The content stops short of the scrollbar's own strip.
+        let w = band.width() - DETAIL_MARGIN - RIGHT_GUTTER;
         let left = band.min.x + DETAIL_MARGIN;
         // The cursor runs in content space; the screen sits it under the
         // scroll offset.
@@ -2320,7 +2463,10 @@ impl Launcher {
         let version_line = match &rel {
             Rel::Here { version, date, .. } => format!("版本 V{version} · {date}"),
             Rel::Pending => "版本 …".to_string(),
-            Rel::Failed(_) => "版本 未知".to_string(),
+            Rel::Failed(_) => match &self.state.repos[idx].installed {
+                Some(v) => format!("版本 V{} · 未获取到发布日期", v.to_uppercase()),
+                None => "版本 未知".to_string(),
+            },
         };
         if draw {
             self.draw_tile(&painter, icon, idx, 14);
@@ -2351,8 +2497,8 @@ impl Launcher {
         // The action button and the little menu beside it, at the right.
         let more_w = 36.0;
         let more_rect = Rect::from_min_max(
-            pos2(band.max.x - DETAIL_MARGIN - more_w, at(30.0)),
-            pos2(band.max.x - DETAIL_MARGIN, at(66.0)),
+            pos2(band.max.x - RIGHT_GUTTER - more_w, at(30.0)),
+            pos2(band.max.x - RIGHT_GUTTER, at(66.0)),
         );
         let main_rect = Rect::from_min_max(
             pos2(more_rect.min.x - 8.0 - 150.0, at(30.0)),
@@ -2470,7 +2616,7 @@ impl Launcher {
         // The divider before the sections.
         if draw {
             painter.hline(
-                band.min.x + DETAIL_MARGIN..=band.max.x - DETAIL_MARGIN,
+                band.min.x + DETAIL_MARGIN..=band.max.x - RIGHT_GUTTER,
                 at(cy),
                 line(p.border),
             );
@@ -2780,6 +2926,28 @@ fn save_descriptions(map: &std::collections::BTreeMap<String, String>) {
     let _ = std::fs::write(path, serde_json::to_string_pretty(map).unwrap_or_default());
 }
 
+/// The last release read for each repository, kept between runs.
+fn releases_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(home)
+        .join("Library/Application Support/GitupLauncher/releases.json")
+}
+
+fn load_releases() -> std::collections::BTreeMap<String, serde_json::Value> {
+    let Ok(text) = std::fs::read_to_string(releases_path()) else {
+        return std::collections::BTreeMap::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn save_releases(map: &std::collections::BTreeMap<String, serde_json::Value>) {
+    let path = releases_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, serde_json::to_string_pretty(map).unwrap_or_default());
+}
+
 /// The Chinese half of a description that carries two languages, e.g.
 /// "中文简介 / An English summary". Anything else is left whole.
 fn first_language(text: &str) -> &str {
@@ -2794,6 +2962,22 @@ fn first_language(text: &str) -> &str {
         }
     }
     text
+}
+
+/// A string shortened with an ellipsis until it fits the given width.
+fn fit_text(ui: &Ui, text_in: &str, font: egui::FontId, max_w: f32) -> String {
+    if measure(ui, text_in, font.clone()) <= max_w {
+        return text_in.to_string();
+    }
+    let mut chars: Vec<char> = text_in.chars().collect();
+    while !chars.is_empty() {
+        chars.pop();
+        let candidate: String = chars.iter().collect::<String>() + "…";
+        if measure(ui, &candidate, font.clone()) <= max_w {
+            return candidate;
+        }
+    }
+    "…".to_string()
 }
 
 /// The egui preference for one of the appearance settings.
@@ -2844,6 +3028,7 @@ fn main() -> eframe::Result<()> {
                     Some("search") => Demo::Search,
                     Some("detail") => Demo::Detail,
                     Some("settings") => Demo::Settings,
+                    Some("hover") => Demo::Hover,
                     _ => Demo::None,
                 };
             }
@@ -2986,22 +3171,14 @@ impl eframe::App for ScreenshotApp {
     }
 }
 
-/// Draws the launcher's icon: no plate at all, a black raven's head in
-/// profile sitting on a white band that fades up into transparency, and
-/// the eye cut clean through so whatever is behind shows in it. Pixels
-/// are straight RGBA, which is what the PNG writer expects.
+/// Draws the launcher's icon: a white rounded plate, and on it a magpie
+/// in profile — black head, back and long tail, a white panel across the
+/// wing and belly, and a white glint for the eye. Every edge is smoothed
+/// with four-by-four samples per pixel. Pixels are straight RGBA, which is
+/// what the PNG writer expects.
 fn render_icon(size: usize) -> egui::ColorImage {
     let s = size as f32;
-    // The bird sits in a box in the middle of the canvas.
-    let bs = s * 0.625;
-    let off = (s - bs) / 2.0;
-    let px = |x: f32, y: f32| (off + x * bs, off + y * bs);
-    let head: Vec<(f32, f32)> = [
-        (0.02, 1.00), (0.02, 0.34), (0.10, 0.13), (0.26, 0.05), (0.46, 0.09),
-        (0.60, 0.23), (0.66, 0.36), (0.94, 0.42), (0.66, 0.52), (0.62, 0.64),
-        (0.70, 0.78), (0.58, 0.86), (0.60, 1.00),
-    ]
-    .to_vec();
+    // A point-in-polygon test, for the bird's body and its white panel.
     let inside_poly = |x: f32, y: f32, poly: &[(f32, f32)]| -> bool {
         let mut inside = false;
         let mut j = poly.len() - 1;
@@ -3015,33 +3192,112 @@ fn render_icon(size: usize) -> egui::ColorImage {
         }
         inside
     };
+    // The bird, in canvas units: tail up and to the left, head and beak to
+    // the right, the belly line running nearly level.
+    let body: [(f32, f32); 15] = [
+        (0.150, 0.238), // tail tip, upper corner
+        (0.445, 0.424), // tail root, where it meets the back
+        (0.545, 0.415), // back
+        (0.612, 0.352), // nape
+        (0.663, 0.302), // crown
+        (0.733, 0.306), // forehead
+        (0.878, 0.366), // beak, tip
+        (0.736, 0.396), // beak, lower edge
+        (0.727, 0.428), // throat
+        (0.712, 0.478), // breast
+        (0.694, 0.552), // belly, front
+        (0.612, 0.606), // belly, underneath
+        (0.455, 0.556), // tail root, underneath
+        (0.352, 0.470), // tail, lower edge
+        (0.196, 0.300), // tail tip, lower corner
+    ];
+    // The white panel the magpie carries across its wing and belly.
+    let panel: [(f32, f32); 6] = [
+        (0.398, 0.460),
+        (0.586, 0.450),
+        (0.654, 0.499),
+        (0.622, 0.547),
+        (0.470, 0.526),
+        (0.414, 0.498),
+    ];
+    // The two legs, and the little feet they end in.
+    let legs: [(f32, f32, f32, f32); 2] = [
+        (0.548, 0.596, 0.540, 0.666),
+        (0.620, 0.590, 0.626, 0.666),
+    ];
+    let feet: [(f32, f32, f32, f32); 2] = [
+        (0.505, 0.668, 0.578, 0.668),
+        (0.590, 0.668, 0.662, 0.668),
+    ];
+    let dist_to_seg = |x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32| -> f32 {
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let len2 = dx * dx + dy * dy;
+        if len2 <= f32::EPSILON {
+            return ((x - x0).powi(2) + (y - y0).powi(2)).sqrt();
+        }
+        let t = (((x - x0) * dx + (y - y0) * dy) / len2).clamp(0.0, 1.0);
+        ((x - (x0 + t * dx)).powi(2) + (y - (y0 + t * dy)).powi(2)).sqrt()
+    };
+    // The plate's rounded rectangle, as a signed distance.
+    let plate_sd = |x: f32, y: f32| -> f32 {
+        let (hw, hh, r) = (0.445, 0.445, 0.205);
+        let qx = (x - 0.5).abs() - (hw - r);
+        let qy = (y - 0.5).abs() - (hh - r);
+        let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+        outside + qx.max(qy).min(0.0) - r
+    };
+    let paper = (0.988f32, 0.988, 0.980);
+    let rim = (0.845f32, 0.845, 0.835);
+    let ink = (0.106f32, 0.106, 0.120);
+    let rim_w = 0.0038;
     let mut pixels = Vec::with_capacity(size * size);
     const N: usize = 4;
-    let bird = (26.0 / 255.0, 26.0 / 255.0, 28.0 / 255.0);
-    let paper = (246.0 / 255.0, 246.0 / 255.0, 244.0 / 255.0);
     for py in 0..size {
         for pxi in 0..size {
-            // Straight RGBA accumulated per sample, then averaged.
             let mut acc = [0.0f32; 4];
             let mut acc_a = 0.0f32;
             for sy in 0..N {
                 for sx in 0..N {
-                    let x = pxi as f32 + (sx as f32 + 0.5) / N as f32;
-                    let y = py as f32 + (sy as f32 + 0.5) / N as f32;
-                    // The white band: solid at the bottom, fading up into
-                    // nothing by the middle of the canvas.
-                    let band = ((y / s - 0.52) / 0.48).clamp(0.0, 1.0);
-                    let band = band * band * (3.0 - 2.0 * band);
-                    let mut c = (paper.0, paper.1, paper.2, band);
-                    // The bird, black and solid, over the band.
-                    if inside_poly(x, y, &head.iter().map(|&(a, b)| px(a, b)).collect::<Vec<_>>()) {
-                        c = (bird.0, bird.1, bird.2, 1.0);
+                    let x = (pxi as f32 + (sx as f32 + 0.5) / N as f32) / s;
+                    let y = (py as f32 + (sy as f32 + 0.5) / N as f32) / s;
+                    let sd = plate_sd(x, y);
+                    if sd > 0.0 {
+                        // Outside the plate: nothing at all.
+                        acc_a += 1.0;
+                        continue;
                     }
-                    // The eye, cut straight through.
-                    let (ex, ey) = px(0.40, 0.27);
-                    let de = ((x - ex).powi(2) + (y - ey).powi(2)).sqrt();
-                    if de <= 0.062 * bs {
-                        c = (0.0, 0.0, 0.0, 0.0);
+                    // The plate, with a hairline rim just inside its edge.
+                    let mut c = if sd > -rim_w {
+                        (rim.0, rim.1, rim.2, 1.0)
+                    } else {
+                        (paper.0, paper.1, paper.2, 1.0)
+                    };
+                    // The bird: a quick box test keeps most samples away
+                    // from the point-in-polygon work.
+                    let near = x > 0.13 && x < 0.90 && y > 0.27 && y < 0.68;
+                    if near && inside_poly(x, y, &body) {
+                        c = (ink.0, ink.1, ink.2, 1.0);
+                        if inside_poly(x, y, &panel) {
+                            c = (paper.0, paper.1, paper.2, 1.0);
+                        }
+                        // The eye: a paper-coloured glint on the black head.
+                        let de = ((x - 0.706).powi(2) + (y - 0.345).powi(2)).sqrt();
+                        if de < 0.0135 {
+                            c = (paper.0, paper.1, paper.2, 1.0);
+                        }
+                    }
+                    // Legs and feet, drawn over the plate.
+                    if near && y > 0.58 {
+                        for (x0, y0, x1, y1) in legs {
+                            if dist_to_seg(x, y, x0, y0, x1, y1) < 0.0055 {
+                                c = (ink.0, ink.1, ink.2, 1.0);
+                            }
+                        }
+                        for (x0, y0, x1, y1) in feet {
+                            if dist_to_seg(x, y, x0, y0, x1, y1) < 0.0055 {
+                                c = (ink.0, ink.1, ink.2, 1.0);
+                            }
+                        }
                     }
                     acc[0] += c.0 * c.3;
                     acc[1] += c.1 * c.3;
@@ -3055,7 +3311,6 @@ fn render_icon(size: usize) -> egui::ColorImage {
             pixels.push(if alpha <= 0.001 {
                 Color32::TRANSPARENT
             } else {
-                // Straight (unmultiplied) colour, as the writer expects.
                 let r = (acc[0] / acc[3]).clamp(0.0, 1.0);
                 let g = (acc[1] / acc[3]).clamp(0.0, 1.0);
                 let b = (acc[2] / acc[3]).clamp(0.0, 1.0);

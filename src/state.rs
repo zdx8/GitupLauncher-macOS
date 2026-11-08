@@ -198,7 +198,7 @@ impl State {
             let missing = (0..n).filter(|&i| on(i) && !self.is_installed(i)).count();
             let failed = (0..n).filter(|&i| on(i) && self.fetch_error(i).is_some()).count();
             self.status = if failed == n {
-                "GitHub 连接失败，请检查网络后点右上角齿轮重试".to_string()
+                "GitHub 连接失败（可能已到每小时请求上限），稍后点左上角刷新按钮重试".to_string()
             } else if failed > 0 {
                 format!("检查完成：{updates} 个可更新，{missing} 个未安装，{failed} 个仓库获取失败")
             } else if updates + missing == 0 {

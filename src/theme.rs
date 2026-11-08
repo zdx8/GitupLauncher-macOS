@@ -147,15 +147,17 @@ pub fn caret_down(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
 pub fn grid_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     let w = rect.width().min(rect.height());
     let c = rect.center();
-    let s = w * 0.20;
-    let g = w * 0.055;
+    // Four squares filling about three quarters of the box.
+    let s = w * 0.30;
+    let g = w * 0.10;
+    let step = s + g;
     for ix in 0..2 {
         for iy in 0..2 {
-            let x = c.x - s - g * 0.5 + ix as f32 * (s + g);
-            let y = c.y - s - g * 0.5 + iy as f32 * (s + g);
+            let x = c.x - step * 0.5 + ix as f32 * step;
+            let y = c.y - step * 0.5 + iy as f32 * step;
             painter.rect_filled(
                 egui::Rect::from_center_size(egui::pos2(x, y), egui::vec2(s, s)),
-                0,
+                1,
                 color,
             );
         }
@@ -166,15 +168,18 @@ pub fn grid_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
 pub fn list_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
     let w = rect.width().min(rect.height());
     let c = rect.center();
-    // The picture's list mark is about 14 pt wide and 12 pt tall.
-    let bar_w = w * 0.40;
-    let bar_h = (w * 0.10).max(1.5);
-    let gap = w * 0.145;
+    // Three bars, as wide as the mark and heavy enough to read small.
+    let bar_w = w * 0.68;
+    let bar_h = (w * 0.13).max(1.6);
+    let gap = w * 0.17;
     for i in 0..3 {
         let y = c.y - gap + i as f32 * gap;
         painter.rect_filled(
-            egui::Rect::from_center_size(egui::pos2(c.x, y), egui::vec2(bar_w, bar_h)),
-            0,
+            egui::Rect::from_min_size(
+                egui::pos2(c.x - bar_w * 0.5, y - bar_h * 0.5),
+                egui::vec2(bar_w, bar_h),
+            ),
+            1,
             color,
         );
     }
