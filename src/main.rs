@@ -2986,89 +2986,86 @@ impl eframe::App for ScreenshotApp {
     }
 }
 
-/// Draws the launcher's icon: a rounded square in the launcher's own ink,
-/// with the "G with a branch" mark in off-white, the ink fading into the
-/// launcher's green towards the bottom. Pixels are straight RGBA, which
-/// is what the PNG writer expects.
+/// Draws the launcher's icon: no plate at all, a black raven's head in
+/// profile sitting on a white band that fades up into transparency, and
+/// the eye cut clean through so whatever is behind shows in it. Pixels
+/// are straight RGBA, which is what the PNG writer expects.
 fn render_icon(size: usize) -> egui::ColorImage {
     let s = size as f32;
-    // The "G" as a bowl of thick bars, with a short mouth and a crossbar
-    // that turns down: a letter and a branch in one. Units are hundredths
-    // of the icon.
-    let u = s / 100.0;
-    let (l, r) = (30.0 * u, 70.0 * u);
-    let (top, bot) = (27.0 * u, 73.0 * u);
-    let hw = 11.0 * u;
-    let b = hw / 2.0;
-    let mid = (top + bot) / 2.0;
-    let (cl, cr, ct, cb) = (l + b, r - b, top + b, bot - b);
-    let mouth_y = mid - hw * 0.1;
-    // Centre lines of the strokes: top, bottom, left, upper right, lower
-    // right, and the crossbar running in towards the mouth.
-    let bars: [(f32, f32, f32, f32); 6] = [
-        (cl, ct, cr, ct),
-        (cl, cb, cr, cb),
-        (cl, ct, cl, cb),
-        (cr, ct, cr, mouth_y - hw * 0.5),
-        (cr, mouth_y + hw * 0.5, cr, cb),
-        ((l + r) / 2.0 - hw * 0.6, cb - b, cr - hw * 0.6, cb - b),
-    ];
-    let seg_dist = |x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32| {
-        let (dx, dy) = (x1 - x0, y1 - y0);
-        let len2 = dx * dx + dy * dy;
-        if len2 <= f32::EPSILON {
-            return ((x - x0).powi(2) + (y - y0).powi(2)).sqrt();
+    // The bird sits in a box in the middle of the canvas.
+    let bs = s * 0.625;
+    let off = (s - bs) / 2.0;
+    let px = |x: f32, y: f32| (off + x * bs, off + y * bs);
+    let head: Vec<(f32, f32)> = [
+        (0.02, 1.00), (0.02, 0.34), (0.10, 0.13), (0.26, 0.05), (0.46, 0.09),
+        (0.60, 0.23), (0.66, 0.36), (0.94, 0.42), (0.66, 0.52), (0.62, 0.64),
+        (0.70, 0.78), (0.58, 0.86), (0.60, 1.00),
+    ]
+    .to_vec();
+    let inside_poly = |x: f32, y: f32, poly: &[(f32, f32)]| -> bool {
+        let mut inside = false;
+        let mut j = poly.len() - 1;
+        for i in 0..poly.len() {
+            let (xi, yi) = poly[i];
+            let (xj, yj) = poly[j];
+            if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+                inside = !inside;
+            }
+            j = i;
         }
-        let t = (((x - x0) * dx + (y - y0) * dy) / len2).clamp(0.0, 1.0);
-        let (qx, qy) = (x0 + t * dx, y0 + t * dy);
-        ((x - qx).powi(2) + (y - qy).powi(2)).sqrt()
+        inside
     };
-    let inset = s * 0.09;
-    let radius = s * 0.22;
-    let (il, ir, it, ib) = (inset, s - inset, inset, s - inset);
     let mut pixels = Vec::with_capacity(size * size);
-    // Four by four samples per pixel smooths every edge.
     const N: usize = 4;
+    let bird = (26.0 / 255.0, 26.0 / 255.0, 28.0 / 255.0);
+    let paper = (246.0 / 255.0, 246.0 / 255.0, 244.0 / 255.0);
     for py in 0..size {
-        for px_i in 0..size {
-            let mut acc = [0.0f32; 3];
+        for pxi in 0..size {
+            // Straight RGBA accumulated per sample, then averaged.
+            let mut acc = [0.0f32; 4];
             let mut acc_a = 0.0f32;
             for sy in 0..N {
                 for sx in 0..N {
-                    let x = px_i as f32 + (sx as f32 + 0.5) / N as f32;
+                    let x = pxi as f32 + (sx as f32 + 0.5) / N as f32;
                     let y = py as f32 + (sy as f32 + 0.5) / N as f32;
-                    let cxq = x.clamp(il + radius, ir - radius);
-                    let cyq = y.clamp(it + radius, ib - radius);
-                    let d = ((x - cxq).powi(2) + (y - cyq).powi(2)).sqrt();
-                    let inside = if x > il && x < ir && y > it && y < ib && d <= radius {
-                        1.0
-                    } else {
-                        0.0
-                    };
-                    let mut md = f32::MAX;
-                    for (x0, y0, x1, y1) in bars {
-                        md = md.min(seg_dist(x, y, x0, y0, x1, y1));
+                    // The white band: solid at the bottom, fading up into
+                    // nothing by the middle of the canvas.
+                    let band = ((y / s - 0.52) / 0.48).clamp(0.0, 1.0);
+                    let band = band * band * (3.0 - 2.0 * band);
+                    let mut c = (paper.0, paper.1, paper.2, band);
+                    // The bird, black and solid, over the band.
+                    if inside_poly(x, y, &head.iter().map(|&(a, b)| px(a, b)).collect::<Vec<_>>()) {
+                        c = (bird.0, bird.1, bird.2, 1.0);
                     }
-                    let m = if md < hw / 2.0 { 1.0 } else { 0.0 };
-                    // Ink at the top fading to the launcher's green below.
-                    let t = (y / s).powf(4.0);
-                    let body = [
-                        body_color(19.0, 31.0, t) * (1.0 - m) + 245.0 * m,
-                        body_color(21.0, 178.0, t) * (1.0 - m) + 245.0 * m,
-                        body_color(24.0, 118.0, t) * (1.0 - m) + 245.0 * m,
-                    ];
-                    for i in 0..3 {
-                        acc[i] += body[i] * inside + 20.0 * (1.0 - inside);
+                    // The eye, cut straight through.
+                    let (ex, ey) = px(0.40, 0.27);
+                    let de = ((x - ex).powi(2) + (y - ey).powi(2)).sqrt();
+                    if de <= 0.062 * bs {
+                        c = (0.0, 0.0, 0.0, 0.0);
                     }
+                    acc[0] += c.0 * c.3;
+                    acc[1] += c.1 * c.3;
+                    acc[2] += c.2 * c.3;
+                    acc[3] += c.3;
                     acc_a += 1.0;
                 }
             }
             let a = acc_a.max(1.0);
-            pixels.push(Color32::from_rgb(
-                (acc[0] / a).round().clamp(0.0, 255.0) as u8,
-                (acc[1] / a).round().clamp(0.0, 255.0) as u8,
-                (acc[2] / a).round().clamp(0.0, 255.0) as u8,
-            ));
+            let alpha = acc[3] / a;
+            pixels.push(if alpha <= 0.001 {
+                Color32::TRANSPARENT
+            } else {
+                // Straight (unmultiplied) colour, as the writer expects.
+                let r = (acc[0] / acc[3]).clamp(0.0, 1.0);
+                let g = (acc[1] / acc[3]).clamp(0.0, 1.0);
+                let b = (acc[2] / acc[3]).clamp(0.0, 1.0);
+                Color32::from_rgba_unmultiplied(
+                    (r * 255.0).round() as u8,
+                    (g * 255.0).round() as u8,
+                    (b * 255.0).round() as u8,
+                    (alpha * 255.0).round() as u8,
+                )
+            });
         }
     }
     egui::ColorImage {
@@ -3076,10 +3073,6 @@ fn render_icon(size: usize) -> egui::ColorImage {
         pixels,
         source_size: Vec2::new(size as f32, size as f32),
     }
-}
-
-fn body_color(dark: f32, light: f32, t: f32) -> f32 {
-    dark + (light - dark) * t
 }
 
 /// Writes a PNG without pulling in an image crate.

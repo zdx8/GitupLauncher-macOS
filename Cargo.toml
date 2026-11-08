@@ -1,6 +1,6 @@
 [package]
 name = "gitup-launcher"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "A small launcher that installs, updates and opens the apps published on GitHub Releases."
 
