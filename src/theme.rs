@@ -277,27 +277,65 @@ pub fn footer_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32, pa
 }
 
 
-/// The wordmark's mark: a bird's head in profile, in the engraved
-/// hand-drawn spirit of the tile artwork, simplified so it stays crisp at
-/// the top bar's small size. One filled shape and a paper-coloured eye.
-pub fn bird_mark(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32, page: egui::Color32) {
+/// The wordmark's first letter: a solid "G" whose crossbar runs on into a
+/// short second leg, like the branch of a repository. Drawn from scratch
+/// rather than copied from anyone's lettering.
+pub fn draw_g_mark(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let w = rect.width();
     let h = rect.height();
-    let pt = |x: f32, y: f32| egui::pos2(rect.min.x + x * w, rect.min.y + y * h);
-    let head = [
-        (0.04, 1.00), (0.04, 0.32), (0.12, 0.10), (0.28, 0.02), (0.48, 0.07),
-        (0.62, 0.21), (0.68, 0.34), (0.96, 0.40), (0.68, 0.50), (0.62, 0.62),
-        (0.62, 0.82), (0.62, 1.00),
-    ];
-    painter.add(egui::Shape::convex_polygon(
-        head.iter().map(|&(x, y)| pt(x, y)).collect(),
+    let t = w * 0.26;
+    let mid_y = rect.center().y;
+    let r = rect.right();
+    let l = rect.left();
+    let top = rect.top();
+    let bottom = rect.bottom();
+    // Top edge, bottom edge and left edge: an open square bracket.
+    painter.rect_filled(
+        egui::Rect::from_min_max(rect.min, egui::pos2(r - t * 0.3, top + t)),
+        0,
         color,
-        Stroke::NONE,
-    ));
-    // The eye, left as a hole in the head the page colour shows through.
-    let eye = pt(0.42, 0.28);
-    painter.circle_filled(eye, w * 0.055, page);
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(l, bottom - t), egui::pos2(r - t * 0.3, bottom)),
+        0,
+        color,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(rect.min, egui::pos2(l + t, bottom)),
+        0,
+        color,
+    );
+    // The right edge, with the little gap that keeps the bowl open.
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(r - t, top), egui::pos2(r, mid_y - h * 0.02)),
+        0,
+        color,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(r - t, mid_y + h * 0.16), egui::pos2(r, bottom)),
+        0,
+        color,
+    );
+    // The crossbar, running in from the right.
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(rect.center().x, mid_y),
+            egui::pos2(r, mid_y + h * 0.18),
+        ),
+        0,
+        color,
+    );
+    // The branch: a short leg dropping from the crossbar.
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(r - t * 1.7, mid_y + h * 0.18),
+            egui::pos2(r - t * 0.7, bottom),
+        ),
+        0,
+        color,
+    );
 }
+
 
 /// A circular arrow, for the check-updates button at the far left of the
 /// toolbar: a ring open at one side and an arrowhead running into the gap.

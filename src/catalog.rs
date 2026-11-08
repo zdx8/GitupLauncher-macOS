@@ -34,8 +34,8 @@ pub struct RepoInfo {
     pub bright: (u8, u8, u8),
 }
 
-/// The repositories, in the order the launcher shows them.
-pub const REPOS: &[RepoInfo] = &[
+/// The built-in repositories, in the order the launcher starts with.
+const BUILTIN: &[RepoInfo] = &[
     RepoInfo {
         id: "netscope",
         name: "NetScope",
@@ -165,6 +165,112 @@ pub const REPOS: &[RepoInfo] = &[
         bright: (0xA5, 0xB4, 0xFC),
     },
 ];
+
+use std::sync::RwLock;
+
+/// The repositories the launcher manages right now: the built-in ones,
+/// plus whatever the person has added. Adding or removing only changes
+/// this list; the built-in entries themselves never move.
+static LIVE: RwLock<Vec<&'static RepoInfo>> = RwLock::new(Vec::new());
+
+/// Fill the live list with the built-in repositories. Called once at
+/// start-up, after the settings have been read.
+pub fn init_builtin() {
+    let mut live = LIVE.write().unwrap();
+    if live.is_empty() {
+        live.extend(BUILTIN.iter());
+    }
+}
+
+/// The repositories the launcher manages right now, in display order.
+pub fn repos() -> Vec<&'static RepoInfo> {
+    LIVE.read().map(|v| v.clone()).unwrap_or_default()
+}
+
+/// Whether a slug belongs to one of the built-in repositories.
+pub fn is_builtin(slug: &str) -> bool {
+    BUILTIN.iter().any(|r| r.slug == slug)
+}
+
+/// Check that something typed in looks like `owner/repo` and is not
+/// already being managed.
+fn check_new_slug(slug: &str) -> Result<String, String> {
+    let slug = slug.trim().trim_end_matches('/');
+    if slug.is_empty() {
+        return Err("请输入仓库地址，格式如 owner/repo".to_string());
+    }
+    let mut parts = slug.splitn(2, '/');
+    let (owner, repo) = (
+        parts.next().unwrap_or(""),
+        parts.next().unwrap_or(""),
+    );
+    let ok_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/');
+    if owner.is_empty()
+        || repo.is_empty()
+        || !slug.chars().all(ok_char)
+        || slug.contains("//")
+    {
+        return Err("仓库地址应为 owner/repo，只能包含字母、数字、- _ .".to_string());
+    }
+    if repos()
+        .iter()
+        .any(|r| r.slug.eq_ignore_ascii_case(slug))
+    {
+        return Err("该仓库已经在订阅列表中".to_string());
+    }
+    Ok(slug.to_string())
+}
+
+/// Add a repository the person typed in. Its card is built by the same
+/// rules the built-in ones follow: the display name is the repo name
+/// without a `-macOS` suffix, the app bundle is that same name, and the
+/// release data fills in the version, date and download.
+pub fn add_custom(slug: &str) -> Result<usize, String> {
+    let slug = check_new_slug(slug)?;
+    let info: &'static RepoInfo = Box::leak(Box::new(custom_info(&slug)));
+    let mut live = LIVE.write().unwrap();
+    live.push(info);
+    Ok(live.len() - 1)
+}
+
+/// Remove a repository the person added. Built-ins stay.
+pub fn remove_custom(slug: &str) {
+    let mut live = LIVE.write().unwrap();
+    live.retain(|r| r.slug != slug);
+}
+
+/// Build an entry for a repository that was not compiled in.
+fn custom_info(slug: &str) -> RepoInfo {
+    let mut parts = slug.splitn(2, '/');
+    let owner = parts.next().unwrap_or("github");
+    let repo = parts.next().unwrap_or(slug);
+    let name = repo
+        .trim_end_matches("-macOS")
+        .trim_end_matches("-macos")
+        .trim_end_matches("-MacOS")
+        .to_string();
+    // The boxes are leaked for the process's lifetime, which is exactly
+    // how long the live list can point at them.
+    let leaker = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    let id = leaker(slug.to_string());
+    let name = leaker(name);
+    let bundle = name;
+    let slug_static = leaker(slug.to_string());
+    let tagline = leaker(format!("由 {} 订阅的 GitHub 仓库", owner));
+    let summary = leaker(slug.to_string());
+    let (r, g, b) = tile_color(id);
+    RepoInfo {
+        id,
+        name,
+        bundle,
+        slug: slug_static,
+        tagline,
+        summary,
+        website: None,
+        features: &[],
+        bright: (r, g, b),
+    }
+}
 
 /// The repository's owner, uppercased for the little badge on the card.
 pub fn owner_of(slug: &str) -> &str {

@@ -208,6 +208,26 @@ pub fn changelog_lines(body: &str) -> Vec<String> {
     summary
 }
 
+/// The repository's own one-line description, when it has one. This is
+/// what the cards show under the name: Chinese when the repository
+/// writes one, whatever language it uses otherwise.
+pub fn fetch_repo_description(slug: &str) -> Option<String> {
+    let url = format!("https://api.github.com/repos/{slug}");
+    let mut req = agent()
+        .get(&url)
+        .set("User-Agent", UA)
+        .set("Accept", "application/vnd.github+json");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        if !token.trim().is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", token.trim()));
+        }
+    }
+    let resp = req.timeout(Duration::from_secs(20)).call().ok()?;
+    let v: Value = resp.into_json().ok()?;
+    let text = v["description"].as_str()?.trim().to_string();
+    Some(text)
+}
+
 /// Stream a file to `dest`, calling `progress` with the bytes moved so far
 /// and the total when it is known. Sets the error string to "cancelled"
 /// when `cancel` was raised; the part-file is removed in that case.

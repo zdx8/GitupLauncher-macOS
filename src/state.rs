@@ -2,7 +2,7 @@
 //! what the person has set. Everything live arrives through `Msg` from
 //! worker threads, and the window redraws as it lands.
 
-use crate::catalog::REPOS;
+use crate::catalog;
 use crate::github::ReleaseInfo;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -73,6 +73,9 @@ pub enum Msg {
         /// it stopped ("cancelled" when the person clicked it away).
         result: Result<String, String>,
     },
+    /// The repository's own description, fetched once and kept on disk.
+    /// An empty string records "asked, and it has none".
+    Description { slug: String, text: String },
     /// An app's own icon, decoded off the window's thread: width, height
     /// and straight RGBA bytes, ready for a texture, plus the texture
     /// coordinates of the artwork inside its transparent padding.
@@ -101,8 +104,9 @@ pub struct State {
 
 impl State {
     pub fn new() -> Self {
+        let list = catalog::repos();
         Self {
-            repos: REPOS
+            repos: list
                 .iter()
                 .map(|_| RepoState {
                     fetch: FetchState::Pending,
@@ -110,7 +114,7 @@ impl State {
                     job: None,
                 })
                 .collect(),
-            subscribed: REPOS.iter().map(|_| true).collect(),
+            subscribed: list.iter().map(|_| true).collect(),
             layout: Layout::Grid,
             sort: SortBy::Name,
             status: "正在检查更新…".to_string(),
@@ -121,8 +125,10 @@ impl State {
     /// Read the installed versions off this Mac. Local and quick, so it
     /// runs on the window's own thread.
     pub fn rescan_installed(&mut self) {
-        for (i, repo) in REPOS.iter().enumerate() {
-            self.repos[i].installed = crate::install::installed_version(repo.bundle);
+        for (i, repo) in catalog::repos().iter().enumerate() {
+            if i < self.repos.len() {
+                self.repos[i].installed = crate::install::installed_version(repo.bundle);
+            }
         }
     }
 
@@ -186,7 +192,7 @@ impl State {
     pub fn apply_meta(&mut self, idx: usize, result: Result<ReleaseInfo, String>) {
         self.repos[idx].fetch = FetchState::Done(result);
         if self.all_fetched() {
-            let n = REPOS.len();
+            let n = self.repos.len();
             let on = |i: usize| self.subscribed[i];
             let updates = (0..n).filter(|&i| on(i) && self.has_update(i)).count();
             let missing = (0..n).filter(|&i| on(i) && !self.is_installed(i)).count();
@@ -261,6 +267,8 @@ pub struct Settings {
     pub install_dir: String,
     /// The ids of the built-in repositories the person has turned off.
     pub disabled: Vec<String>,
+    /// The slugs of repositories the person added themselves.
+    pub custom: Vec<String>,
 }
 
 impl Default for Settings {
@@ -271,6 +279,7 @@ impl Default for Settings {
             include_pre: false,
             install_dir: "/Applications".to_string(),
             disabled: Vec::new(),
+            custom: Vec::new(),
         }
     }
 }
@@ -311,6 +320,12 @@ pub fn load_settings() -> Settings {
             .filter_map(|x| x.as_str().map(|t| t.to_string()))
             .collect();
     }
+    if let Some(list) = v["custom"].as_array() {
+        s.custom = list
+            .iter()
+            .filter_map(|x| x.as_str().map(|t| t.to_string()))
+            .collect();
+    }
     s
 }
 
@@ -325,6 +340,7 @@ pub fn save_settings(settings: &Settings) {
         "include_pre": settings.include_pre,
         "install_dir": settings.install_dir,
         "disabled": settings.disabled,
+        "custom": settings.custom,
     });
     let _ = std::fs::write(path, serde_json::to_string_pretty(&v).unwrap_or_default());
 }

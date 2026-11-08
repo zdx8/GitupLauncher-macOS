@@ -25,10 +25,9 @@ mod state;
 mod theme;
 mod version;
 
-use catalog::REPOS;
+use catalog::repos;
 use eframe::egui::{
-    self, pos2, vec2, Align2, Color32, Rect, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui,
-    Vec2,
+    self, pos2, vec2, Align2, Color32, Rect, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
 };
 use state::{FetchState, JobPhase, Layout as View, Msg, SortBy, State};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,6 +108,11 @@ struct Launcher {
     detail_expanded: bool,
     /// What the person has set, kept between runs.
     settings: state::Settings,
+    /// What is typed in the add-repository box on the settings page.
+    settings_input: String,
+    /// Each repository's own description, kept on disk so the API is
+    /// asked at most once per repository.
+    descriptions: std::collections::BTreeMap<String, String>,
 }
 
 impl Launcher {
@@ -122,6 +126,13 @@ impl Launcher {
             _ => {}
         }
         cc.egui_ctx.set_theme(theme_preference(settings.theme));
+
+        // The live list starts as the built-ins plus whatever was added
+        // last time, so the window opens with exactly what it should.
+        catalog::init_builtin();
+        for slug in &settings.custom {
+            let _ = catalog::add_custom(slug);
+        }
 
         let (tx, rx) = std::sync::mpsc::channel();
         let mut state = State::new();
@@ -138,14 +149,16 @@ impl Launcher {
             tx,
             rx,
             ctx: cc.egui_ctx.clone(),
-            icons: REPOS.iter().map(|_| None).collect(),
-            icon_uv: REPOS.iter().map(|_| (0.0, 0.0, 1.0, 1.0)).collect(),
+            icons: repos().iter().map(|_| None).collect(),
+            icon_uv: repos().iter().map(|_| (0.0, 0.0, 1.0, 1.0)).collect(),
             page: Page::Grid,
             detail_scroll: 0.0,
             detail_expanded: false,
             settings,
+            settings_input: String::new(),
+            descriptions: load_descriptions(),
         };
-        for (i, repo) in REPOS.iter().enumerate() {
+        for (i, repo) in repos().iter().enumerate() {
             launcher.state.subscribed[i] = !launcher.settings.disabled.iter().any(|d| d == repo.id);
         }
         if launcher.settings.auto_check {
@@ -160,16 +173,16 @@ impl Launcher {
     /// Whether this repository is subscribed, and a toggle that keeps the
     /// setting file in step.
     fn toggle_subscription(&mut self, idx: usize) {
-        let id = REPOS[idx].id;
+        let id = repos()[idx].id;
         let on = !self.settings.disabled.iter().any(|d| d == id);
         if on {
             self.settings.disabled.push(id.to_string());
             self.state.subscribed[idx] = false;
-            self.state.status = format!("已取消订阅 {}", REPOS[idx].name);
+            self.state.status = format!("已取消订阅 {}", repos()[idx].name);
         } else {
             self.settings.disabled.retain(|d| d != id);
             self.state.subscribed[idx] = true;
-            self.state.status = format!("已订阅 {}", REPOS[idx].name);
+            self.state.status = format!("已订阅 {}", repos()[idx].name);
         }
         state::save_settings(&self.settings);
     }
@@ -196,9 +209,9 @@ impl Launcher {
                 Color32::WHITE,
             );
         } else {
-            let (r, g, b) = catalog::tile_color(REPOS[idx].id);
+            let (r, g, b) = catalog::tile_color(repos()[idx].id);
             painter.rect_filled(tile, radius(corner), Color32::from_rgb(r, g, b));
-            let letter = REPOS[idx].name.chars().next().unwrap_or('?');
+            let letter = repos()[idx].name.chars().next().unwrap_or('?');
             painter.text(
                 pos2(tile.center().x, tile.center().y + tile.width() * 0.03),
                 Align2::CENTER_CENTER,
@@ -215,7 +228,7 @@ impl Launcher {
     fn spawn_icon_load(&mut self) {
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
-        let bundles: Vec<(usize, String)> = REPOS
+        let bundles: Vec<(usize, String)> = repos()
             .iter()
             .enumerate()
             .filter(|(i, _)| self.state.is_installed(*i))
@@ -246,29 +259,145 @@ impl Launcher {
         self.state.set_all_fetching();
         self.state.status = "正在检查更新…".to_string();
         let include_pre = self.settings.include_pre;
-        for idx in 0..REPOS.len() {
+        for idx in 0..repos().len() {
             if !self.state.subscribed[idx] {
                 continue;
             }
             let tx = self.tx.clone();
             let ctx = self.ctx.clone();
-            let slug = REPOS[idx].slug.to_string();
+            let slug = repos()[idx].slug.to_string();
+            let cached = self.descriptions.contains_key(&slug);
             std::thread::spawn(move || {
                 let result = github::fetch_latest_release(&slug, include_pre);
                 let _ = tx.send(Msg::Meta { idx, result });
+                if !cached {
+                    if let Some(text) = github::fetch_repo_description(&slug) {
+                        let _ = tx.send(Msg::Description { slug, text });
+                    }
+                }
                 ctx.request_repaint();
             });
         }
     }
 
 
+    /// Ask GitHub about one repository only, on its own thread.
+    fn spawn_meta_one(&mut self, idx: usize) {
+        let list = repos();
+        if idx >= list.len() {
+            return;
+        }
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        let slug = list[idx].slug.to_string();
+        let include_pre = self.settings.include_pre;
+        let cached = self.descriptions.contains_key(&slug);
+        std::thread::spawn(move || {
+            let result = github::fetch_latest_release(&slug, include_pre);
+            let _ = tx.send(Msg::Meta { idx, result });
+            if !cached {
+                if let Some(text) = github::fetch_repo_description(&slug) {
+                    let _ = tx.send(Msg::Description { slug, text });
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Keep the per-row side tables the same length as the live list.
+    fn sync_arrays(&mut self) {
+        let n = repos().len();
+        self.icons.resize(n, None);
+        self.icon_uv.resize(n, (0.0, 0.0, 1.0, 1.0));
+    }
+
+    /// Rebuild every per-row table after the live list has changed shape.
+    /// Any running download is cancelled first, so no late message lands
+    /// on the wrong row.
+    fn rebuild_repos(&mut self) {
+        for repo in self.state.repos.iter() {
+            if let Some(job) = &repo.job {
+                job.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+        let mut fresh = State::new();
+        fresh.layout = self.state.layout;
+        fresh.sort = self.state.sort;
+        for (i, repo) in repos().iter().enumerate() {
+            fresh.subscribed[i] = !self.settings.disabled.iter().any(|d| d == repo.id);
+        }
+        fresh.rescan_installed();
+        self.state = fresh;
+        self.icons = repos().iter().map(|_| None).collect();
+        self.icon_uv = repos().iter().map(|_| (0.0, 0.0, 1.0, 1.0)).collect();
+        self.page = Page::Grid;
+        self.spawn_meta_fetch_all();
+        self.spawn_icon_load();
+    }
+
+    /// Add a repository typed into the settings page. It joins the list
+    /// by the same rules as everything else: its newest release is read
+    /// straight away, its installed copy is looked for, and its icon is
+    /// loaded if the app is already here.
+    fn add_repository(&mut self, input: &str) {
+        match catalog::add_custom(input) {
+            Ok(idx) => {
+                let slug = repos()[idx].slug.to_string();
+                self.settings.custom.push(slug.clone());
+                state::save_settings(&self.settings);
+                self.sync_arrays();
+                let installed = install::installed_version(repos()[idx].bundle);
+                self.state.repos.push(state::RepoState {
+                    fetch: FetchState::Pending,
+                    installed,
+                    job: None,
+                });
+                self.state.subscribed.push(true);
+                self.state.status = format!("已添加订阅 {}", slug);
+                self.settings_input.clear();
+                self.spawn_meta_one(idx);
+                self.spawn_icon_load();
+            }
+            Err(e) => self.state.status = e,
+        }
+    }
+
+    /// Remove a repository the person added. Built-ins are only ever
+    /// switched off, never deleted.
+    fn remove_repository(&mut self, idx: usize) {
+        let list = repos();
+        if idx >= list.len() || catalog::is_builtin(list[idx].slug) {
+            return;
+        }
+        if self.state.busy(idx) {
+            self.state.status = "该仓库正在下载，请稍后再移除".to_string();
+            return;
+        }
+        let slug = list[idx].slug.to_string();
+        catalog::remove_custom(&slug);
+        self.settings.custom.retain(|s| s != &slug);
+        state::save_settings(&self.settings);
+        self.rebuild_repos();
+        self.state.status = format!("已移除订阅 {slug}");
+    }
+
+    /// The line under an app's name: the repository's own description
+    /// (Chinese when it has one), and the built-in text when it has none.
+    fn summary_text(&self, idx: usize) -> String {
+        let repo = repos()[idx];
+        match self.descriptions.get(repo.slug) {
+            Some(text) if !text.is_empty() => first_language(text).to_string(),
+            _ => repo.summary.to_string(),
+        }
+    }
+
     /// The repositories that pass the search box, in the chosen order.
     fn visible(&self) -> Vec<usize> {
         let q = self.search.trim().to_lowercase();
-        let mut list: Vec<usize> = (0..REPOS.len())
+        let mut list: Vec<usize> = (0..repos().len())
             .filter(|&i| self.state.subscribed[i])
             .filter(|&i| {
-                let a = &REPOS[i];
+                let a = &repos()[i];
                 q.is_empty()
                     || a.name.to_lowercase().contains(&q)
                     || a.tagline.to_lowercase().contains(&q)
@@ -277,7 +406,7 @@ impl Launcher {
             })
             .collect();
         match self.state.sort {
-            SortBy::Name => list.sort_by(|&a, &b| REPOS[a].name.cmp(&REPOS[b].name)),
+            SortBy::Name => list.sort_by(|&a, &b| repos()[a].name.cmp(&repos()[b].name)),
             // Newest first. The dates are ISO strings, so plain text order
             // is date order; a repository with no answer sorts last.
             SortBy::Updated => list.sort_by(|&a, &b| {
@@ -318,12 +447,21 @@ impl Launcher {
     fn handle_messages(&mut self) {
         let mut done_seen = false;
         while let Ok(msg) = self.rx.try_recv() {
+            // A list resize may have left an old answer on the way; it
+            // must not land on whatever row happens to sit at that index.
+            let idx_ok = |idx: usize, repos: &Vec<state::RepoState>| idx < repos.len();
             match msg {
-                Msg::Meta { idx, result } => self.state.apply_meta(idx, result),
-                Msg::Progress { idx, done, total } => self.state.apply_progress(idx, done, total),
-                Msg::Installing { idx } => self.state.apply_installing(idx),
-                Msg::Done { idx, result } => {
-                    let name = REPOS[idx].name;
+                Msg::Meta { idx, result } if idx_ok(idx, &self.state.repos) => {
+                    self.state.apply_meta(idx, result)
+                }
+                Msg::Progress { idx, done, total } if idx_ok(idx, &self.state.repos) => {
+                    self.state.apply_progress(idx, done, total)
+                }
+                Msg::Installing { idx } if idx_ok(idx, &self.state.repos) => {
+                    self.state.apply_installing(idx)
+                }
+                Msg::Done { idx, result } if idx_ok(idx, &self.state.repos) => {
+                    let name = repos()[idx].name;
                     match result {
                         Ok(ver) => {
                             let was_installed = self.state.repos[idx].installed.is_some();
@@ -355,19 +493,26 @@ impl Launcher {
                     height,
                     uv,
                     rgba,
-                } => {
+                } if idx < self.icons.len() => {
                     let image = egui::ColorImage::from_rgba_unmultiplied(
                         [width as usize, height as usize],
                         &rgba,
                     );
                     let texture = self.ctx.load_texture(
-                        format!("app-icon-{}", REPOS[idx].id),
+                        format!("app-icon-{}", repos()[idx].id),
                         image,
                         egui::TextureOptions::LINEAR,
                     );
                     self.icons[idx] = Some(texture);
                     self.icon_uv[idx] = uv;
                 }
+                Msg::Description { slug, text } => {
+                    self.descriptions.insert(slug, text);
+                    save_descriptions(&self.descriptions);
+                }
+                // Anything arriving for a row that no longer exists is
+                // simply dropped.
+                _ => {}
             }
         }
         if done_seen {
@@ -388,7 +533,7 @@ impl Launcher {
             } else {
                 self.state.status = format!(
                     "未能获取 {} 的版本信息：{}",
-                    REPOS[idx].name,
+                    repos()[idx].name,
                     self.state.fetch_error(idx).unwrap_or("没有可用的安装包")
                 );
             }
@@ -396,7 +541,7 @@ impl Launcher {
         };
         let Some(asset) = rel.asset.clone() else {
             self.state.status =
-                format!("{} 的最新发布里没有 macOS 安装包", REPOS[idx].name);
+                format!("{} 的最新发布里没有 macOS 安装包", repos()[idx].name);
             return;
         };
         let cancel = Arc::new(AtomicBool::new(false));
@@ -405,10 +550,10 @@ impl Launcher {
             phase: JobPhase::Downloading,
             cancel: cancel.clone(),
         });
-        self.state.status = format!("正在下载 {}…", REPOS[idx].name);
+        self.state.status = format!("正在下载 {}…", repos()[idx].name);
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
-        let bundle = REPOS[idx].bundle.to_string();
+        let bundle = repos()[idx].bundle.to_string();
         std::thread::spawn(move || {
             let dir = std::env::temp_dir().join("gitup-launcher/download");
             let _ = std::fs::create_dir_all(&dir);
@@ -434,22 +579,22 @@ impl Launcher {
 
     /// Open the installed app.
     fn open_app(&mut self, idx: usize) {
-        match install::open_app(REPOS[idx].bundle) {
-            Ok(()) => self.state.status = format!("已打开 {}", REPOS[idx].name),
+        match install::open_app(repos()[idx].bundle) {
+            Ok(()) => self.state.status = format!("已打开 {}", repos()[idx].name),
             Err(e) => self.state.status = format!("打开失败: {e}"),
         }
     }
 
     /// Show the repository's page in the browser.
     fn open_repo_page(&mut self, idx: usize) {
-        let url = format!("https://github.com/{}", REPOS[idx].slug);
+        let url = format!("https://github.com/{}", repos()[idx].slug);
         let _ = std::process::Command::new("open").arg(&url).spawn();
-        self.state.status = format!("已在浏览器打开 {}", REPOS[idx].slug);
+        self.state.status = format!("已在浏览器打开 {}", repos()[idx].slug);
     }
 
     /// Copy the repository's address.
     fn copy_link(&mut self, idx: usize) {
-        let url = format!("https://github.com/{}", REPOS[idx].slug);
+        let url = format!("https://github.com/{}", repos()[idx].slug);
         self.ctx.copy_text(url);
         self.state.status = "已复制仓库链接".to_string();
     }
@@ -466,7 +611,7 @@ impl Launcher {
                 .map(|j| j.cancel.clone());
             if let Some(cancel) = cancel {
                 cancel.store(true, Ordering::SeqCst);
-                self.state.status = format!("正在取消下载 {}…", REPOS[idx].name);
+                self.state.status = format!("正在取消下载 {}…", repos()[idx].name);
             }
         } else if self.state.has_update(idx) {
             self.start_job(idx);
@@ -602,11 +747,10 @@ impl Launcher {
                 // The wordmark, sitting clear of the traffic lights: the
                 // bird mark and the letters, drawn here rather than taken
                 // from anyone's artwork.
-                bird_mark(
+                draw_g_mark(
                     ui.painter(),
-                    Rect::from_center_size(pos2(WORDMARK_X + 9.0, mid), vec2(19.0, 17.0)),
+                    Rect::from_center_size(pos2(WORDMARK_X + 9.0, mid), vec2(18.0, 16.0)),
                     p.text,
-                    p.bg,
                 );
                 ui.painter().text(
                     pos2(WORDMARK_X + 19.0, mid + 0.5),
@@ -720,11 +864,11 @@ impl Launcher {
             if let Page::Detail(idx) = self.page {
                 match which {
                     0 => {
-                        let next = (idx + REPOS.len() - 1) % REPOS.len();
+                        let next = (idx + repos().len() - 1) % repos().len();
                         self.open_page(next);
                     }
                     1 => {
-                        let next = (idx + 1) % REPOS.len();
+                        let next = (idx + 1) % repos().len();
                         self.open_page(next);
                     }
                     _ => self.page = Page::Grid,
@@ -826,16 +970,27 @@ impl Launcher {
             .rect_filled(search_rect, 0, p.search_fill);
         ui.painter()
             .rect_stroke(search_rect, 0, line(p.border), StrokeKind::Middle);
+        // The hint sits square in the middle of the box, drawn by hand:
+        // the field's own hint can only hug the left edge.
+        if self.search.is_empty() {
+            ui.painter().text(
+                search_rect.center(),
+                Align2::CENTER_CENTER,
+                "搜索应用",
+                text(13.0),
+                p.muted,
+            );
+        }
         let edit = TextEdit::singleline(&mut self.search)
-            .hint_text(RichText::new("搜索应用").color(p.muted))
             .text_color(p.text)
             .frame(egui::Frame::NONE)
             .desired_width(search_rect.width() - 16.0);
-        // The box is drawn by hand, so the real field sits on top of it.
+        // The box is drawn by hand, so the real field sits on top of it,
+        // riding the box's middle line.
         let mut child = ui.new_child(
             egui::UiBuilder::new().max_rect(Rect::from_min_max(
-                pos2(search_rect.min.x + 8.0, search_rect.min.y),
-                pos2(search_rect.max.x - 8.0, search_rect.max.y),
+                pos2(search_rect.min.x + 8.0, search_rect.center().y - 9.5),
+                pos2(search_rect.max.x - 8.0, search_rect.center().y + 9.5),
             )),
         );
         child.add(edit);
@@ -1079,7 +1234,7 @@ impl Launcher {
         let clip = ui.painter().with_clip_rect(vis);
         let painter = &clip;
 
-        let app = &REPOS[idx];
+        let app = &repos()[idx];
         // Everything read off the state is copied out up front, so the
         // borrows are done before anything calls back into it.
         let installed = self.state.is_installed(idx);
@@ -1211,7 +1366,8 @@ impl Launcher {
         // The English description, on the left below the tile.
         let desc_y = header.max.y + TILE + 46.0;
         let wrap_w = card.width() - 20.0;
-        let galley = painter.layout(app.summary.to_string(), text(14.0), p.muted, wrap_w);
+        let summary = self.summary_text(idx);
+        let galley = painter.layout(summary, text(14.0), p.muted, wrap_w);
         let galley_h = galley.size().y;
         painter.galley(pos2(card.min.x + 20.0, desc_y - 7.0), galley, p.muted);
 
@@ -1354,7 +1510,7 @@ impl Launcher {
     /// The small menu beside a card's button, drawn on top of the cards.
     fn draw_menu(&mut self, ui: &mut Ui, anchor: Rect, idx: usize, body: Rect, p: &Palette) {
         let painter = ui.painter();
-        let app = &REPOS[idx];
+        let app = &repos()[idx];
         let installed = self.state.is_installed(idx);
         let entries: Vec<&str> = if installed {
             vec!["打开", "重新安装", "复制链接"]
@@ -1458,14 +1614,13 @@ impl Launcher {
         let right_x = left + col_w + 40.0;
 
         // The page's own heading.
-        bird_mark(
+        draw_g_mark(
             &painter,
-            Rect::from_center_size(pos2(left + 10.0, band.min.y + 34.0), vec2(24.0, 21.0)),
+            Rect::from_center_size(pos2(left + 11.0, band.min.y + 33.0), vec2(22.0, 20.0)),
             p.text,
-            p.bg,
         );
         painter.text(
-            pos2(left + 30.0, band.min.y + 34.0),
+            pos2(left + 32.0, band.min.y + 34.0),
             Align2::LEFT_CENTER,
             "设置",
             display(26.0),
@@ -1679,14 +1834,18 @@ impl Launcher {
             text(11.5),
             p.faint,
         );
-        ry += 26.0;
+        ry += 24.0;
+        let list = repos();
         let sub_cols = 2;
         let sub_cell_w = (col_w - 12.0) / sub_cols as f32;
-        for (i, repo) in REPOS.iter().enumerate() {
+        for (i, repo) in list.iter().enumerate() {
             let col = i % sub_cols;
             let row = i / sub_cols;
             let x = right_x + col as f32 * (sub_cell_w + 12.0);
-            let yy = ry + row as f32 * 30.0;
+            let yy = ry + row as f32 * 26.0;
+            if i >= self.state.subscribed.len() {
+                break;
+            }
             let checked = self.state.subscribed[i];
             let box_r = Rect::from_min_size(pos2(x, yy - 9.0), vec2(18.0, 18.0));
             painter.rect_stroke(box_r, radius(4), line(p.border), StrokeKind::Middle);
@@ -1703,14 +1862,49 @@ impl Launcher {
                     s,
                 );
             }
+            let custom = !catalog::is_builtin(repo.slug);
+            // A repository the person added gets a little cross at the end
+            // of its row that removes it altogether.
+            let name_w = sub_cell_w - 26.0 - if custom { 18.0 } else { 0.0 };
             painter.text(
-                pos2(box_r.max.x + 10.0, box_r.center().y),
+                pos2(box_r.max.x + 8.0, box_r.center().y),
                 Align2::LEFT_CENTER,
                 repo.name,
-                text(13.5),
+                text(13.0),
                 if checked { p.text } else { p.faint },
             );
-            let hit = Rect::from_min_size(pos2(x, yy - 14.0), vec2(sub_cell_w, 28.0));
+            let _ = name_w;
+            if custom {
+                let cx = Rect::from_min_size(
+                    pos2(x + sub_cell_w - 20.0, yy - 10.0),
+                    vec2(18.0, 18.0),
+                );
+                let c = cx.center();
+                let st = Stroke::new(1.4, p.faint);
+                painter.line_segment(
+                    [egui::pos2(c.x - 4.0, c.y - 4.0), egui::pos2(c.x + 4.0, c.y + 4.0)],
+                    st,
+                );
+                painter.line_segment(
+                    [egui::pos2(c.x + 4.0, c.y - 4.0), egui::pos2(c.x - 4.0, c.y + 4.0)],
+                    st,
+                );
+                let hit = cx.intersect(band);
+                if hit.is_positive() {
+                    let resp = ui.interact(
+                        hit,
+                        ui.scope_id().with(("settings-remove", repo.slug)),
+                        Sense::click(),
+                    );
+                    if resp.clicked() {
+                        self.remove_repository(i);
+                    }
+                }
+            }
+            let hit = Rect::from_min_size(
+                pos2(x, yy - 13.0),
+                vec2(sub_cell_w - if custom { 22.0 } else { 0.0 }, 26.0),
+            );
             if hit.intersect(band).is_positive() {
                 let resp = ui.interact(
                     hit,
@@ -1722,42 +1916,69 @@ impl Launcher {
                 }
             }
         }
-        ry += ((REPOS.len() + 1) / 2) as f32 * 30.0 + 20.0;
+        let sub_rows = list.len().div_ceil(sub_cols) as f32;
+        ry += sub_rows * 26.0 + 16.0;
 
-        // --------------------------------------------------- right: about
-        painter.text(pos2(right_x, ry), Align2::LEFT_CENTER, "关于", text(15.0), p.text);
-        ry += 30.0;
-        painter.text(
-            pos2(right_x, ry),
-            Align2::LEFT_CENTER,
-            "Gitup Launcher — 管理这些 GitHub 仓库的发布、安装与更新。",
-            text(13.0),
-            p.muted,
+        // The add box: a slug goes in, the same rules take over from there.
+        let add_w = col_w - 72.0;
+        let add_box = Rect::from_min_size(pos2(right_x, ry), vec2(add_w, 30.0));
+        painter.rect_filled(add_box, 0, p.search_fill);
+        painter.rect_stroke(add_box, 0, line(p.border), StrokeKind::Middle);
+        if self.settings_input.is_empty() {
+            painter.text(
+                pos2(add_box.min.x + 10.0, add_box.center().y),
+                Align2::LEFT_CENTER,
+                "owner/repo，如 zdx8/Foo-macOS",
+                text(12.0),
+                p.faint,
+            );
+        }
+        let mut child = ui.new_child(
+            egui::UiBuilder::new().max_rect(Rect::from_min_max(
+                pos2(add_box.min.x + 8.0, add_box.min.y),
+                pos2(add_box.max.x - 8.0, add_box.max.y),
+            )),
         );
-        ry += 30.0;
-        let gh = Rect::from_min_size(pos2(right_x, ry), vec2(110.0, 30.0));
-        painter.rect_stroke(gh, 0, line(p.border), StrokeKind::Middle);
+        child.add(
+            TextEdit::singleline(&mut self.settings_input)
+                .text_color(p.text)
+                .frame(egui::Frame::NONE)
+                .desired_width(add_box.width() - 16.0),
+        );
+        let add_btn = Rect::from_min_size(
+            pos2(add_box.max.x + 8.0, ry),
+            vec2(64.0, 30.0),
+        );
+        painter.rect_stroke(add_btn, 0, line(p.border), StrokeKind::Middle);
         painter.text(
-            pos2(gh.min.x + 14.0, gh.center().y),
-            Align2::LEFT_CENTER,
-            "GITHUB",
+            pos2(add_btn.center().x, add_btn.center().y),
+            Align2::CENTER_CENTER,
+            "添加",
             text(13.0),
             p.text,
         );
-        arrow_out(
-            &painter,
-            Rect::from_center_size(pos2(gh.max.x - 16.0, gh.center().y), vec2(12.0, 12.0)),
-            p.muted,
-        );
-        let hit = gh.intersect(band);
+        let hit = add_btn.intersect(band);
         if hit.is_positive() {
-            let resp = ui.interact(hit, ui.scope_id().with("settings-github"), Sense::click());
+            let resp = ui.interact(hit, ui.scope_id().with("settings-add"), Sense::click());
             if resp.clicked() {
-                let _ = std::process::Command::new("open")
-                    .arg("https://github.com/zdx8")
-                    .spawn();
+                let typed = self.settings_input.clone();
+                self.add_repository(&typed);
             }
         }
+        // Enter in the box does the same as the button.
+        if self.settings_input.ends_with('\n') {
+            self.settings_input = self.settings_input.trim_end().to_string();
+            let typed = self.settings_input.clone();
+            self.add_repository(&typed);
+        }
+        ry += 44.0;
+        painter.text(
+            pos2(right_x, ry),
+            Align2::LEFT_CENTER,
+            "添加后自动拉取最新发布、查找本机已装版本并加载图标。",
+            text(11.5),
+            p.faint,
+        );
 
         // --------------------------------------------- the bottom buttons
         let by = band.max.y - 44.0;
@@ -1843,7 +2064,7 @@ impl Launcher {
 
         let scroll = self.state.scroll;
         for (i, &idx) in apps.iter().enumerate() {
-            let app = &REPOS[idx];
+            let app = &repos()[idx];
             let y = band.min.y + head_h + i as f32 * (row_h + 4.0) - scroll;
             if y + row_h < band.min.y + head_h || y > band.max.y {
                 continue;
@@ -2042,7 +2263,7 @@ impl Launcher {
         p: &Palette,
         draw: bool,
     ) -> f32 {
-        let app = &REPOS[idx];
+        let app = &repos()[idx];
         let painter = ui.painter().with_clip_rect(band);
         let w = band.width() - 2.0 * DETAIL_MARGIN;
         let left = band.min.x + DETAIL_MARGIN;
@@ -2301,6 +2522,18 @@ impl Launcher {
             }
         }
         let feature_rows = app.features.len().div_ceil(2);
+        if app.features.is_empty() {
+            if draw {
+                painter.text(
+                    pos2(left, at(cy)),
+                    Align2::LEFT_CENTER,
+                    "该仓库没有内置的功能介绍，版本与更新都在下面。",
+                    text(13.0),
+                    p.faint,
+                );
+            }
+            cy += 30.0;
+        }
         cy += feature_rows as f32 * (card_h + 16.0) + 26.0;
 
         // -------------------------------------------- 02 latest release
@@ -2522,6 +2755,47 @@ impl Launcher {
     }
 }
 
+/// Where the fetched descriptions are kept between runs.
+fn descriptions_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(home)
+        .join("Library/Application Support/GitupLauncher/descriptions.json")
+}
+
+fn load_descriptions() -> std::collections::BTreeMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(descriptions_path()) else {
+        return std::collections::BTreeMap::new();
+    };
+    let Ok(map) = serde_json::from_str::<std::collections::BTreeMap<String, String>>(&text) else {
+        return std::collections::BTreeMap::new();
+    };
+    map
+}
+
+fn save_descriptions(map: &std::collections::BTreeMap<String, String>) {
+    let path = descriptions_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, serde_json::to_string_pretty(map).unwrap_or_default());
+}
+
+/// The Chinese half of a description that carries two languages, e.g.
+/// "中文简介 / An English summary". Anything else is left whole.
+fn first_language(text: &str) -> &str {
+    if let Some((head, tail)) = text.split_once(" / ") {
+        let tail_is_english = tail
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false);
+        if tail_is_english {
+            return head.trim();
+        }
+    }
+    text
+}
+
 /// The egui preference for one of the appearance settings.
 fn theme_preference(mode: state::ThemeMode) -> egui::ThemePreference {
     match mode {
@@ -2584,7 +2858,7 @@ fn main() -> eframe::Result<()> {
             // Draws the app's own icon once, without opening a window.
             "--make-icon" => {
                 if let Some(path) = args.next() {
-                    let image = render_bird_icon(1024);
+                    let image = render_icon(1024);
                     write_png(std::path::Path::new(&path), &image);
                     return Ok(());
                 }
@@ -2712,147 +2986,89 @@ impl eframe::App for ScreenshotApp {
     }
 }
 
-/// The app's own icon, drawn from the same coordinates as the tile bird:
-/// a green rounded square, a white raven's head in profile with a black
-/// outline, fine feather hatching, and the eye with its glint. Pixels
-/// are straight RGBA, which is what the PNG writer expects.
-fn render_bird_icon(size: usize) -> egui::ColorImage {
+/// Draws the launcher's icon: a rounded square in the launcher's own ink,
+/// with the "G with a branch" mark in off-white, the ink fading into the
+/// launcher's green towards the bottom. Pixels are straight RGBA, which
+/// is what the PNG writer expects.
+fn render_icon(size: usize) -> egui::ColorImage {
     let s = size as f32;
-    // The bird sits in a box in the middle of the canvas.
-    let bs = s * 0.625;
-    let off = (s - bs) / 2.0;
-    let px = |x: f32, y: f32| (off + x * bs, off + y * bs);
-    let head: Vec<(f32, f32)> = [
-        (0.02, 1.00), (0.02, 0.34), (0.10, 0.13), (0.26, 0.05), (0.46, 0.09),
-        (0.60, 0.23), (0.66, 0.36), (0.94, 0.42), (0.66, 0.52), (0.62, 0.64),
-        (0.70, 0.78), (0.58, 0.86), (0.60, 1.00),
-    ]
-    .to_vec();
-    let hatches: Vec<(f32, f32, f32)> = [
-        (0.18, 0.44, 0.07), (0.27, 0.48, 0.08), (0.15, 0.56, 0.08), (0.25, 0.60, 0.09),
-        (0.34, 0.55, 0.07), (0.20, 0.68, 0.09), (0.30, 0.72, 0.09), (0.13, 0.78, 0.08),
-        (0.40, 0.42, 0.05), (0.43, 0.60, 0.07), (0.36, 0.82, 0.08), (0.24, 0.88, 0.08),
-        (0.46, 0.72, 0.07), (0.52, 0.56, 0.05), (0.10, 0.90, 0.08), (0.50, 0.90, 0.06),
-        (0.32, 0.96, 0.06),
-    ]
-    .to_vec();
-    let ink = (34.0 / 255.0, 34.0 / 255.0, 36.0 / 255.0);
-    let paper = (0.957, 0.953, 0.937);
-    let dist_to_seg = |x: f32, y: f32, a: (f32, f32), b: (f32, f32)| -> f32 {
-        let (x0, y0) = a;
-        let (x1, y1) = b;
+    // The "G" as a bowl of thick bars, with a short mouth and a crossbar
+    // that turns down: a letter and a branch in one. Units are hundredths
+    // of the icon.
+    let u = s / 100.0;
+    let (l, r) = (30.0 * u, 70.0 * u);
+    let (top, bot) = (27.0 * u, 73.0 * u);
+    let hw = 11.0 * u;
+    let b = hw / 2.0;
+    let mid = (top + bot) / 2.0;
+    let (cl, cr, ct, cb) = (l + b, r - b, top + b, bot - b);
+    let mouth_y = mid - hw * 0.1;
+    // Centre lines of the strokes: top, bottom, left, upper right, lower
+    // right, and the crossbar running in towards the mouth.
+    let bars: [(f32, f32, f32, f32); 6] = [
+        (cl, ct, cr, ct),
+        (cl, cb, cr, cb),
+        (cl, ct, cl, cb),
+        (cr, ct, cr, mouth_y - hw * 0.5),
+        (cr, mouth_y + hw * 0.5, cr, cb),
+        ((l + r) / 2.0 - hw * 0.6, cb - b, cr - hw * 0.6, cb - b),
+    ];
+    let seg_dist = |x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32| {
         let (dx, dy) = (x1 - x0, y1 - y0);
         let len2 = dx * dx + dy * dy;
         if len2 <= f32::EPSILON {
             return ((x - x0).powi(2) + (y - y0).powi(2)).sqrt();
         }
-        // How far along the segment the closest point sits.
         let t = (((x - x0) * dx + (y - y0) * dy) / len2).clamp(0.0, 1.0);
         let (qx, qy) = (x0 + t * dx, y0 + t * dy);
         ((x - qx).powi(2) + (y - qy).powi(2)).sqrt()
     };
-    let inside_poly = |x: f32, y: f32, poly: &[(f32, f32)]| -> bool {
-        let mut inside = false;
-        let mut j = poly.len() - 1;
-        for i in 0..poly.len() {
-            let (xi, yi) = poly[i];
-            let (xj, yj) = poly[j];
-            if (yi > y) != (yj > y)
-                && x < (xj - xi) * (y - yi) / (yj - yi) + xi
-            {
-                inside = !inside;
-            }
-            j = i;
-        }
-        inside
-    };
-    let radius = s * 0.2227;
+    let inset = s * 0.09;
+    let radius = s * 0.22;
+    let (il, ir, it, ib) = (inset, s - inset, inset, s - inset);
     let mut pixels = Vec::with_capacity(size * size);
+    // Four by four samples per pixel smooths every edge.
     const N: usize = 4;
     for py in 0..size {
-        for pxi in 0..size {
+        for px_i in 0..size {
             let mut acc = [0.0f32; 3];
             let mut acc_a = 0.0f32;
             for sy in 0..N {
                 for sx in 0..N {
-                    let x = pxi as f32 + (sx as f32 + 0.5) / N as f32;
+                    let x = px_i as f32 + (sx as f32 + 0.5) / N as f32;
                     let y = py as f32 + (sy as f32 + 0.5) / N as f32;
-                    // The rounded square behind everything, with its
-                    // vertical green gradient.
-                    let cx = x.clamp(radius, s - radius);
-                    let cy = y.clamp(radius, s - radius);
-                    let inside = x > 0.0 && x < s && y > 0.0 && y < s
-                        && ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() <= radius;
-                    if !inside {
-                        continue;
-                    }
-                    let t = (y / s).powf(1.0);
-                    let mut c = (
-                        0x0F as f32 / 255.0 + (0x15 as f32 - 0x0F as f32) / 255.0 * t,
-                        0x9D as f32 / 255.0 + (0xB2 as f32 - 0x9D as f32) / 255.0 * t,
-                        0x58 as f32 / 255.0 + (0x76 as f32 - 0x58 as f32) / 255.0 * t,
-                    );
-                    // The head's white fill. The polygon is mapped into
-                    // canvas coordinates first, so the test matches the
-                    // strokes below.
-                    let (hx, hy) = (x, y);
-                    let head_pts: Vec<(f32, f32)> =
-                        head.iter().map(|&(a, b)| px(a, b)).collect();
-                    if inside_poly(hx, hy, &head_pts) {
-                        c = paper;
-                    }
-                    // The outline and every stroke drawn on top.
-                    let mut stroke = dist_to_seg(hx, hy, head_pts[0], head_pts[head_pts.len() - 1])
-                        < 0.011 * bs;
-                    for i in 0..head_pts.len() - 1 {
-                        if dist_to_seg(hx, hy, head_pts[i], head_pts[i + 1]) < 0.011 * bs {
-                            stroke = true;
-                        }
-                    }
-                    let thin = |a: (f32, f32), b: (f32, f32), w: f32| -> bool {
-                        dist_to_seg(hx, hy, px(a.0, a.1), px(b.0, b.1)) < w * bs
+                    let cxq = x.clamp(il + radius, ir - radius);
+                    let cyq = y.clamp(it + radius, ib - radius);
+                    let d = ((x - cxq).powi(2) + (y - cyq).powi(2)).sqrt();
+                    let inside = if x > il && x < ir && y > it && y < ib && d <= radius {
+                        1.0
+                    } else {
+                        0.0
                     };
-                    if thin((0.64, 0.36), (0.93, 0.415), 0.009)
-                        || thin((0.10, 0.33), (0.16, 0.14), 0.009)
-                        || thin((0.16, 0.14), (0.30, 0.10), 0.009)
-                        || thin((0.64, 0.62), (0.73, 0.76), 0.008)
-                        || thin((0.73, 0.76), (0.60, 0.86), 0.008)
-                    {
-                        stroke = true;
+                    let mut md = f32::MAX;
+                    for (x0, y0, x1, y1) in bars {
+                        md = md.min(seg_dist(x, y, x0, y0, x1, y1));
                     }
-                    for (a, b, l) in &hatches {
-                        if thin((*a, *b), (a + 0.4 * l, b + l), 0.0065) {
-                            stroke = true;
-                        }
+                    let m = if md < hw / 2.0 { 1.0 } else { 0.0 };
+                    // Ink at the top fading to the launcher's green below.
+                    let t = (y / s).powf(4.0);
+                    let body = [
+                        body_color(19.0, 31.0, t) * (1.0 - m) + 245.0 * m,
+                        body_color(21.0, 178.0, t) * (1.0 - m) + 245.0 * m,
+                        body_color(24.0, 118.0, t) * (1.0 - m) + 245.0 * m,
+                    ];
+                    for i in 0..3 {
+                        acc[i] += body[i] * inside + 20.0 * (1.0 - inside);
                     }
-                    if stroke {
-                        c = ink;
-                    }
-                    // The eye, with its glint, on top of everything.
-                    let (ex, ey) = px(0.40, 0.27);
-                    let de = ((hx - ex).powi(2) + (hy - ey).powi(2)).sqrt();
-                    if de <= 0.062 * bs {
-                        c = ink;
-                    }
-                    let (gx, gy) = px(0.42, 0.25);
-                    let dg = ((hx - gx).powi(2) + (hy - gy).powi(2)).sqrt();
-                    if dg <= 0.016 * bs {
-                        c = paper;
-                    }
-                    acc[0] += c.0;
-                    acc[1] += c.1;
-                    acc[2] += c.2;
                     acc_a += 1.0;
                 }
             }
-            if acc_a <= 0.0 {
-                // Outside the rounded square: transparent, so the corners
-                // do not show up black anywhere.
-                pixels.push(Color32::TRANSPARENT);
-            } else {
-                let v = |t: f32| (t * 255.0 / acc_a).round().clamp(0.0, 255.0) as u8;
-                pixels.push(Color32::from_rgb(v(acc[0]), v(acc[1]), v(acc[2])));
-            }
+            let a = acc_a.max(1.0);
+            pixels.push(Color32::from_rgb(
+                (acc[0] / a).round().clamp(0.0, 255.0) as u8,
+                (acc[1] / a).round().clamp(0.0, 255.0) as u8,
+                (acc[2] / a).round().clamp(0.0, 255.0) as u8,
+            ));
         }
     }
     egui::ColorImage {
@@ -2860,6 +3076,10 @@ fn render_bird_icon(size: usize) -> egui::ColorImage {
         pixels,
         source_size: Vec2::new(size as f32, size as f32),
     }
+}
+
+fn body_color(dark: f32, light: f32, t: f32) -> f32 {
+    dark + (light - dark) * t
 }
 
 /// Writes a PNG without pulling in an image crate.
