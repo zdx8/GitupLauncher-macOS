@@ -1,0 +1,38 @@
+[package]
+name = "gitup-launcher"
+version = "0.3.9"
+edition = "2021"
+description = "A small launcher that installs, updates and opens the apps published on GitHub Releases."
+
+[[bin]]
+name = "gitup-launcher"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = [
+    # The window's clipboard: without this feature the keyboard shortcuts
+    # for copy and paste have no system clipboard behind them, and
+    # Command-V does nothing at all.
+    "clipboard",
+    "default_fonts",
+    "glow",
+    "system_fonts",
+    "wayland",
+    "x11",
+] }
+egui = "0.37"
+egui_system_font_provider = "0.37"
+ureq = { version = "2", default-features = false, features = [
+    "tls",
+    "json",
+    "gzip",
+    "socks-proxy",
+] }
+serde_json = "1"
+png = "0.17"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
