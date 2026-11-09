@@ -45,6 +45,12 @@ const FOOTER_H: f32 = 34.0;
 const WORDMARK_X: f32 = 92.0;
 /// The height of the strip at the top of a card (its rule is at 163 pt).
 const CARD_HEAD_H: f32 = 39.0;
+/// A few addresses, for the bulk importer's demo screen.
+const SAMPLE_LIST: &str = "https://github.com/diamondfsd/luna-ai-cut
+zdx8/NetScope-macOS
+# 以 # 开头的行会被跳过
+不是链接的一行";
+
 /// The height of the 未安装 heading in the grid.
 const SECTION_H: f32 = 42.0;
 /// The width of one card's app tile.
@@ -71,6 +77,16 @@ enum Demo {
     Settings,
     Hover,
     Picker,
+    Batch,
+    BatchRun,
+}
+
+/// The bulk importer: a list of addresses pasted or read from the
+/// clipboard, and what came of them.
+struct Batch {
+    text: String,
+    /// What happened, once the list has been read.
+    report: Option<String>,
 }
 
 /// The version chooser: one app's releases, with the one being looked at.
@@ -143,6 +159,8 @@ struct Launcher {
     pending_scroll_end: bool,
     /// The version chooser, when it is open.
     picker: Option<Picker>,
+    /// The bulk importer, when it is open.
+    batch: Option<Batch>,
 }
 
 impl Launcher {
@@ -192,6 +210,7 @@ impl Launcher {
             settings_error: None,
             pending_scroll_end: false,
             picker: None,
+            batch: None,
         };
         // A repository the person added is either in the list or deleted,
         // never merely switched off; a stale entry there used to hide it
@@ -397,7 +416,6 @@ impl Launcher {
                 let slug = repos()[idx].slug.to_string();
                 self.settings.custom.push(slug.clone());
                 self.settings.disabled.retain(|d| d != &slug);
-                self.state.subscribed[idx] = true;
                 state::save_settings(&self.settings);
                 self.sync_arrays();
                 let installed = install::installed_version(repos()[idx].bundle);
@@ -763,6 +781,8 @@ impl Launcher {
 /// The launcher's own state plus the current appearance.
 struct App {
     launcher: Launcher,
+    /// The demo screen is set up once, not on every frame.
+    demo_applied: bool,
 }
 
 impl eframe::App for App {
@@ -860,8 +880,10 @@ impl eframe::App for App {
             ctx.set_style_of(theme, style);
         }
 
-        // The demo screens.
-        match self.launcher.demo {
+        // The demo screens, set up on the first frame only.
+        if !self.demo_applied {
+            self.demo_applied = true;
+            match self.launcher.demo {
             Demo::List => self.launcher.state.layout = View::List,
             Demo::Menu => self.launcher.menu_for = Some(0),
             Demo::Sort => self.launcher.sort_open = true,
@@ -876,7 +898,23 @@ impl eframe::App for App {
             Demo::Hover => self.launcher.hover_demo = Some(0),
             // The version chooser for the first app.
             Demo::Picker => self.launcher.open_versions(0),
-            Demo::None => {}
+            // The bulk importer, with a sample list in it.
+            Demo::Batch => {
+                self.launcher.open_batch();
+                if let Some(batch) = self.launcher.batch.as_mut() {
+                    batch.text = SAMPLE_LIST.to_string();
+                }
+            }
+            // The bulk importer, run at once.
+            Demo::BatchRun => {
+                self.launcher.open_batch();
+                if let Some(batch) = self.launcher.batch.as_mut() {
+                    batch.text = SAMPLE_LIST.to_string();
+                }
+                self.launcher.import_repositories(SAMPLE_LIST);
+            }
+                Demo::None => {}
+            }
         }
 
         // Whatever the worker threads have reported lands here, before
@@ -940,8 +978,10 @@ impl eframe::App for App {
                 if let Some((rect, idx)) = self.launcher.pending_menu.take() {
                     self.launcher.draw_menu(ui, rect, idx, body, &p);
                 }
-                // The version chooser sits above everything else.
+                // The version chooser and the bulk importer sit above
+                // everything else.
                 self.launcher.draw_picker(ui, full, &p);
+                self.launcher.draw_batch(ui, full, &p);
             });
     }
 }
@@ -2014,6 +2054,191 @@ impl Launcher {
         self.state.status = format!("已在浏览器打开 {} 的更新说明", repos()[idx].name);
     }
 
+    /// Open the bulk importer. Whatever is on the clipboard is put in it
+    /// straight away, so a list can be imported without typing at all.
+    fn open_batch(&mut self) {
+        let text = clipboard_text().unwrap_or_default();
+        self.batch = Some(Batch {
+            text,
+            report: None,
+        });
+    }
+
+    /// Read every address in the box and subscribe to all of them at once.
+    fn import_repositories(&mut self, text: &str) {
+        let mut added = 0usize;
+        let mut known = 0usize;
+        let mut bad: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            match catalog::add_custom(line) {
+                Ok(idx) => {
+                    let slug = repos()[idx].slug.to_string();
+                    if !self.settings.custom.iter().any(|s| s == &slug) {
+                        self.settings.custom.push(slug.clone());
+                    }
+                    self.settings.disabled.retain(|d| d != &slug);
+                    added += 1;
+                }
+                Err(e) => {
+                    if e.contains("已经在订阅") {
+                        known += 1;
+                    } else {
+                        bad.push(format!("{line} —— {e}"));
+                    }
+                }
+            }
+        }
+        state::save_settings(&self.settings);
+        if added > 0 {
+            let page = self.page;
+            self.rebuild_repos();
+            self.page = page;
+            self.pending_scroll_end = true;
+        }
+        let mut report = format!("已导入 {added} 个仓库");
+        if known > 0 {
+            report.push_str(&format!("，{known} 个此前已经订阅"));
+        }
+        if !bad.is_empty() {
+            report.push_str(&format!("，{} 行无法识别", bad.len()));
+        }
+        self.state.status = report.clone();
+        if let Some(batch) = self.batch.as_mut() {
+            batch.report = Some(if bad.is_empty() {
+                report
+            } else {
+                format!("{report}\n\n{}", bad.join("\n"))
+            });
+        }
+    }
+
+    /// The bulk importer: one box, many repositories.
+    fn draw_batch(&mut self, ui: &mut Ui, full: Rect, p: &Palette) {
+        let Some(batch) = self.batch.as_mut() else {
+            return;
+        };
+        ui.interact(full, egui::Id::unique("batch-scrim"), Sense::click());
+        ui.painter()
+            .rect_filled(full, 0, Color32::from_black_alpha(140));
+        let rect = Rect::from_center_size(full.center(), vec2(640.0, 470.0));
+        let painter = ui.painter().clone();
+        let painter = &painter;
+        painter.rect_filled(rect, radius(6), p.bg);
+        painter.rect_stroke(rect, 0, line(p.border), StrokeKind::Middle);
+        painter.text(
+            pos2(rect.min.x + 28.0, rect.min.y + 34.0),
+            Align2::LEFT_CENTER,
+            "批量导入仓库",
+            display(22.0),
+            p.text,
+        );
+        painter.text(
+            pos2(rect.min.x + 28.0, rect.min.y + 66.0),
+            Align2::LEFT_CENTER,
+            "每行一个链接或 owner/repo；空行与以 # 开头的行会跳过。",
+            text(12.5),
+            p.faint,
+        );
+
+        let box_rect = Rect::from_min_size(
+            pos2(rect.min.x + 28.0, rect.min.y + 86.0),
+            vec2(rect.width() - 56.0, 210.0),
+        );
+        painter.rect_filled(box_rect, 0, p.search_fill);
+        painter.rect_stroke(box_rect, 0, line(p.border), StrokeKind::Middle);
+        if batch.text.is_empty() {
+            painter.text(
+                pos2(box_rect.min.x + 12.0, box_rect.min.y + 14.0),
+                Align2::LEFT_CENTER,
+                "https://github.com/owner/repo（一行一个）",
+                text(12.0),
+                p.faint,
+            );
+        }
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(Rect::from_min_max(
+                    pos2(box_rect.min.x + 8.0, box_rect.min.y + 6.0),
+                    pos2(box_rect.max.x - 8.0, box_rect.max.y - 6.0),
+                ))
+                .id_salt("batch-text"),
+        );
+        child.add_sized(
+            vec2(box_rect.width() - 16.0, box_rect.height() - 12.0),
+            TextEdit::multiline(&mut batch.text)
+                .id(egui::Id::unique("batch-field"))
+                .text_color(p.text)
+                .frame(egui::Frame::NONE)
+                .desired_width(box_rect.width() - 16.0),
+        );
+
+        // What came of the last attempt, line by line.
+        if let Some(report) = &batch.report {
+            let galley = painter.layout(
+                report.clone(),
+                text(12.0),
+                p.muted,
+                rect.width() - 56.0,
+            );
+            painter.galley(
+                pos2(rect.min.x + 28.0, box_rect.max.y + 12.0),
+                galley,
+                p.muted,
+            );
+        }
+
+        let close = Rect::from_min_size(
+            pos2(rect.min.x + 28.0, rect.max.y - 58.0),
+            vec2(110.0, 38.0),
+        );
+        if action_button(ui, painter, close, egui::Id::unique("batch-close"), "关闭", 13.0, full, p) {
+            self.batch = None;
+            return;
+        }
+        let from_clip = Rect::from_min_max(
+            pos2(rect.max.x - 28.0 - 158.0 - 150.0, rect.max.y - 58.0),
+            pos2(rect.max.x - 28.0 - 158.0, rect.max.y - 20.0),
+        );
+        if action_button(
+            ui,
+            painter,
+            from_clip,
+            egui::Id::unique("batch-clip"),
+            "从剪贴板读取",
+            12.5,
+            full,
+            p,
+        ) {
+            if let Some(text) = clipboard_text() {
+                batch.text = text;
+                batch.report = None;
+            } else {
+                batch.report = Some("剪贴板里没有文字".to_string());
+            }
+        }
+        let import = Rect::from_min_max(
+            pos2(rect.max.x - 28.0 - 150.0, rect.max.y - 58.0),
+            pos2(rect.max.x - 28.0, rect.max.y - 20.0),
+        );
+        if primary_button(
+            ui,
+            painter,
+            import,
+            egui::Id::unique("batch-import"),
+            "导入",
+            13.0,
+            full,
+            p,
+        ) {
+            let text = batch.text.clone();
+            self.import_repositories(&text);
+        }
+    }
+
     /// The version chooser: a panel in the middle of the window with the
     /// release list, and a button that installs whichever one is chosen.
     fn draw_picker(&mut self, ui: &mut Ui, full: Rect, p: &Palette) {
@@ -2617,7 +2842,7 @@ impl Launcher {
             painter.text(
                 pos2(add_box.min.x + 10.0, add_box.center().y),
                 Align2::LEFT_CENTER,
-                "粘贴仓库链接，或填写 owner/repo",
+                "粘贴链接或 owner/repo；多个用「批量导入…」",
                 text(12.0),
                 p.faint,
             );
@@ -2661,18 +2886,18 @@ impl Launcher {
             }
         }
 
-        let paste_btn = Rect::from_min_size(
+        let batch_btn = Rect::from_min_size(
             pos2(add_box.max.x + 8.0, ry),
-            vec2(96.0, 32.0),
+            vec2(100.0, 32.0),
         );
         let add_btn = Rect::from_min_size(
-            pos2(paste_btn.max.x + 8.0, ry),
+            pos2(batch_btn.max.x + 8.0, ry),
             vec2(64.0, 32.0),
         );
         let mut submit = field_resp.lost_focus()
             && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        for (rect, caption, id, paste) in [
-            (paste_btn, "粘贴并添加", "settings-paste", true),
+        for (rect, caption, id, opens_batch) in [
+            (batch_btn, "批量导入…", "settings-batch", true),
             (add_btn, "添加", "settings-add", false),
         ] {
             let hit = rect.intersect(band);
@@ -2705,17 +2930,8 @@ impl Launcher {
                 if hovered { p.accent } else { p.text },
             );
             if clicked {
-                if paste {
-                    match clipboard_text() {
-                        Some(text) => {
-                            self.settings_input = text;
-                            submit = true;
-                        }
-                        None => {
-                            self.settings_error =
-                                Some("剪贴板里没有文字，先复制仓库链接".to_string());
-                        }
-                    }
+                if opens_batch {
+                    self.open_batch();
                 } else {
                     submit = true;
                 }
@@ -3817,6 +4033,8 @@ fn main() -> eframe::Result<()> {
                     Some("settings") => Demo::Settings,
                     Some("hover") => Demo::Hover,
                     Some("picker") => Demo::Picker,
+                    Some("batch") => Demo::Batch,
+                    Some("batch-run") => Demo::BatchRun,
                     _ => Demo::None,
                 };
             }
@@ -3887,7 +4105,10 @@ fn main() -> eframe::Result<()> {
                         std::process::exit(4);
                     });
                     Ok(Box::new(ScreenshotApp {
-                        inner: App { launcher },
+                        inner: App {
+                            launcher,
+                            demo_applied: false,
+                        },
                         path,
                         frame: 0,
                         pass: 0,
@@ -3900,7 +4121,10 @@ fn main() -> eframe::Result<()> {
                         arrived,
                     }))
                 }
-                None => Ok(Box::new(App { launcher })),
+                None => Ok(Box::new(App {
+                    launcher,
+                    demo_applied: false,
+                })),
             }
         }),
     )
@@ -3969,15 +4193,15 @@ impl eframe::App for ScreenshotApp {
             if self.pass == 20 {
                 raw_input
                     .events
-                    .push(egui::Event::PointerMoved(egui::pos2(800.0, 500.0)));
+                    .push(egui::Event::PointerMoved(egui::pos2(720.0, 537.0)));
             }
-            click(21, egui::pos2(800.0, 500.0), raw_input);
+            click(21, egui::pos2(720.0, 537.0), raw_input);
             if self.pass == 26 {
                 raw_input.events.push(egui::Event::Text(
                     "https://github.com/diamondfsd/luna-ai-cut".to_string(),
                 ));
             }
-            click(40, egui::pos2(1070.0, 500.0), raw_input);
+            click(40, egui::pos2(1042.0, 537.0), raw_input);
         }
     }
 
