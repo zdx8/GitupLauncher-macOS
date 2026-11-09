@@ -1,0 +1,6 @@
+# Build output and local state
+/target/
+/.cargo-home/
+*.app/
+/shots/
+.DS_Store
