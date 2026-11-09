@@ -4,7 +4,7 @@
 //! a near-black page (#121316), hairline borders (#333436) and one accent
 //! blue used for versions, badges and links.
 
-use egui::{Color32, CornerRadius, FontId, Stroke, StrokeKind};
+use egui::{Color32, CornerRadius, FontId, Stroke};
 
 /// One set of colours, so the same drawing code works in both appearances.
 #[derive(Clone, Copy)]
@@ -188,98 +188,6 @@ pub fn list_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
 
 /// The little marks in the footer: a globe and seven simple social shapes,
 /// drawn in the spirit of the original's row without copying its logos.
-/// The picture's marks are about 19 pt across and 15 pt tall.
-pub fn footer_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32, page: Color32, which: usize) {
-    let w = rect.width().min(rect.height());
-    let c = rect.center();
-    let s = Stroke::new((w * 0.13).max(1.2), color);
-    let p = |x: f32, y: f32| egui::pos2(c.x + x * w, c.y + y * w);
-    match which {
-        // A globe: a circle, a meridian and two lines of latitude.
-        0 => {
-            painter.circle_stroke(c, w * 0.38, s);
-            painter.add(egui::Shape::line(
-                vec![p(0.0, -0.38), p(-0.17, 0.0), p(0.0, 0.38), p(0.17, 0.0), p(0.0, -0.38)],
-                s,
-            ));
-            painter.line_segment([p(-0.38, 0.0), p(0.38, 0.0)], s);
-        }
-        // A code branch: a stem splitting in two, in a round frame.
-        1 => {
-            painter.circle_stroke(c, w * 0.38, s);
-            painter.circle_filled(p(0.0, -0.22), w * 0.08, color);
-            painter.circle_filled(p(-0.18, 0.22), w * 0.08, color);
-            painter.circle_filled(p(0.18, 0.22), w * 0.08, color);
-            painter.line_segment([p(0.0, -0.14), p(0.0, 0.06)], s);
-            painter.line_segment([p(-0.18, 0.14), p(0.0, 0.04)], s);
-            painter.line_segment([p(0.18, 0.14), p(0.0, 0.04)], s);
-        }
-        // A game controller: a rounded body with two eyes.
-        2 => {
-            painter.rect_stroke(
-                egui::Rect::from_center_size(c, egui::vec2(w * 0.78, w * 0.52)),
-                radius(9),
-                s,
-                StrokeKind::Middle,
-            );
-            painter.circle_filled(p(-0.16, 0.0), w * 0.07, color);
-            painter.circle_filled(p(0.16, 0.0), w * 0.07, color);
-        }
-        // An X, outlined.
-        3 => {
-            let stroke = Stroke::new(w * 0.07, color);
-            painter.line_segment([p(-0.28, -0.30), p(0.28, 0.30)], stroke);
-            painter.line_segment([p(0.28, -0.30), p(-0.28, 0.30)], stroke);
-        }
-        // A camera: a rounded square with a lens and a small bump.
-        4 => {
-            painter.rect_stroke(
-                egui::Rect::from_center_size(c, egui::vec2(w * 0.74, w * 0.66)),
-                radius(6),
-                s,
-                StrokeKind::Middle,
-            );
-            painter.circle_stroke(p(0.0, 0.02), w * 0.18, s);
-            painter.circle_filled(p(0.22, -0.20), w * 0.04, color);
-        }
-        // A square with two bars inside it.
-        5 => {
-            painter.rect_stroke(
-                egui::Rect::from_center_size(c, egui::vec2(w * 0.76, w * 0.70)),
-                0,
-                s,
-                StrokeKind::Middle,
-            );
-            painter.circle_filled(p(-0.16, -0.16), w * 0.06, color);
-            painter.line_segment([p(-0.16, -0.02), p(-0.16, 0.20)], s);
-            painter.line_segment([p(0.04, -0.02), p(0.04, 0.20)], s);
-            painter.line_segment([p(0.04, 0.06), p(0.20, 0.06)], s);
-        }
-        // A play button: a filled pill with a page-coloured triangle.
-        6 => {
-            painter.rect_filled(
-                egui::Rect::from_center_size(c, egui::vec2(w * 0.86, w * 0.62)),
-                radius(6),
-                color,
-            );
-            painter.add(egui::Shape::convex_polygon(
-                vec![p(-0.09, -0.15), p(-0.09, 0.15), p(0.17, 0.0)],
-                page,
-                Stroke::NONE,
-            ));
-        }
-        // A music note: a filled head and a stem with a flag.
-        _ => {
-            painter.circle_filled(p(-0.10, 0.20), w * 0.12, color);
-            painter.line_segment([p(0.0, 0.20), p(0.0, -0.30)], s);
-            painter.add(egui::Shape::line(
-                vec![p(0.0, -0.30), p(0.20, -0.22), p(0.20, -0.04)],
-                s,
-            ));
-        }
-    }
-
-}
 
 
 /// The wordmark's first letter: a solid "G" whose crossbar runs on into a

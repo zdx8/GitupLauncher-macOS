@@ -32,6 +32,14 @@ pub enum JobPhase {
 pub struct Job {
     /// 0.0 .. 1.0, from the real byte counts.
     pub progress: f32,
+    /// Bytes a second, smoothed, so the footer can say how fast the
+    /// download is really going.
+    pub speed: f32,
+    /// The byte count and the moment the last measurement was taken.
+    pub last: Option<(u64, std::time::Instant)>,
+    /// Bytes moved so far, and the size of the file.
+    pub done: u64,
+    pub total: u64,
     pub phase: JobPhase,
     /// Raised to make the worker thread stop and clean up after itself.
     pub cancel: Arc<AtomicBool>,
@@ -216,6 +224,22 @@ impl State {
             } else {
                 0.5
             };
+            job.done = done;
+            job.total = total;
+            // A rate measured over the gap since the last report, then
+            // smoothed, so the number does not jump about.
+            if let Some((last_done, last_at)) = job.last {
+                let secs = last_at.elapsed().as_secs_f32();
+                if secs > 0.05 && done >= last_done {
+                    let instant = (done - last_done) as f32 / secs;
+                    job.speed = if job.speed > 0.0 {
+                        job.speed * 0.6 + instant * 0.4
+                    } else {
+                        instant
+                    };
+                }
+            }
+            job.last = Some((done, std::time::Instant::now()));
         }
     }
 

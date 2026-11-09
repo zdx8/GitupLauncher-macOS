@@ -33,6 +33,58 @@ pub fn decode_png_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     Ok((w, h, rgba))
 }
 
+/// Some apps ship their icon on an opaque white canvas rather than on
+/// transparent padding. Stretched into a tile, that white square shows as a
+/// white card behind the artwork. Everything white that is reachable from
+/// the icon's border is cleared to transparent, which removes the canvas
+/// and leaves the artwork on nothing.
+pub fn clear_white_plate(width: u32, height: u32, rgba: &mut [u8]) {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for x in 0..w {
+        for y in [0, h - 1] {
+            if white_at(rgba, y * w + x) {
+                stack.push((x, y));
+            }
+        }
+    }
+    for y in 0..h {
+        for x in [0, w - 1] {
+            if white_at(rgba, y * w + x) {
+                stack.push((x, y));
+            }
+        }
+    }
+    while let Some((x, y)) = stack.pop() {
+        let i = y * w + x;
+        if !white_at(rgba, i) {
+            continue;
+        }
+        rgba[i * 4 + 3] = 0;
+        if x > 0 {
+            stack.push((x - 1, y));
+        }
+        if x + 1 < w {
+            stack.push((x + 1, y));
+        }
+        if y > 0 {
+            stack.push((x, y - 1));
+        }
+        if y + 1 < h {
+            stack.push((x, y + 1));
+        }
+    }
+}
+
+fn white_at(rgba: &[u8], i: usize) -> bool {
+    let p = &rgba[i * 4..i * 4 + 4];
+    p[3] > 200 && p[0] > 232 && p[1] > 232 && p[2] > 232
+}
+
 /// The part of a decoded icon that actually carries artwork, as texture
 /// coordinates (u0, v0, u1, v1). A Mac icon is a rounded square floating
 /// inside transparent padding; stretching just this part makes the

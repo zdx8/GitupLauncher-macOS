@@ -43,8 +43,6 @@ const TOOLBAR_H: f32 = 77.0;
 const FOOTER_H: f32 = 34.0;
 /// Where the wordmark starts, clear of the traffic lights.
 const WORDMARK_X: f32 = 92.0;
-/// Where the suite name starts, after the divider.
-const SUITE_X: f32 = 300.0;
 /// The height of the strip at the top of a card (its rule is at 163 pt).
 const CARD_HEAD_H: f32 = 39.0;
 /// The width of one card's app tile.
@@ -260,7 +258,10 @@ impl Launcher {
                 let Some(bytes) = install::bundle_icon_png(&bundle) else {
                     continue;
                 };
-                if let Ok((width, height, rgba)) = icon::decode_png_rgba(&bytes) {
+                if let Ok((width, height, mut rgba)) = icon::decode_png_rgba(&bytes) {
+                    // An icon that ships on a white canvas would otherwise
+                    // drop a white card into the tile.
+                    icon::clear_white_plate(width, height, &mut rgba);
                     let uv = icon::artwork_uv(width, height, &rgba);
                     let _ = tx.send(Msg::Icon {
                         idx,
@@ -594,6 +595,10 @@ impl Launcher {
         let cancel = Arc::new(AtomicBool::new(false));
         self.state.repos[idx].job = Some(state::Job {
             progress: 0.0,
+            speed: 0.0,
+            last: None,
+            done: 0,
+            total: 0,
             phase: JobPhase::Downloading,
             cancel: cancel.clone(),
         });
@@ -676,6 +681,55 @@ struct App {
 }
 
 impl eframe::App for App {
+    /// Command-V in the add-repository field. The window manager normally
+    /// turns that into a paste event, which the field handles itself; when
+    /// it does not, the clipboard is read here and put in the field, so
+    /// pasting never depends on that path working.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if self.launcher.page != Page::Settings {
+            return;
+        }
+        let field = egui::Id::unique("settings-add-field");
+        if !ctx.memory(|m| m.has_focus(field)) {
+            return;
+        }
+        if raw_input
+            .events
+            .iter()
+            .any(|e| matches!(e, egui::Event::Paste(_)))
+        {
+            return;
+        }
+        let cmd_v = raw_input.events.iter().any(|e| {
+            matches!(
+                e,
+                egui::Event::Key {
+                    key: egui::Key::V,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.command
+            )
+        });
+        if !cmd_v {
+            return;
+        }
+        if let Some(text) = clipboard_text() {
+            self.launcher.settings_input.push_str(&text);
+        }
+        raw_input.events.retain(|e| {
+            !matches!(
+                e,
+                egui::Event::Key {
+                    key: egui::Key::V,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.command
+            )
+        });
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // The window's own backdrop, matching the page colour.
         egui::Color32::from_rgb(0x12, 0x13, 0x16).to_normalized_gamma_f32()
@@ -752,10 +806,33 @@ impl eframe::App for App {
             .filter(|r| r.job.is_some())
             .count();
         if running > 0 && self.launcher.state.status.starts_with("正在下载") {
-            self.launcher.state.status = if running == 1 {
-                "正在下载…".to_string()
+            let busy: Vec<(usize, f32, u64, u64)> = self
+                .launcher
+                .state
+                .repos
+                .iter()
+                .enumerate()
+                .filter_map(|(i, r)| r.job.as_ref().map(|j| (i, j.speed, j.done, j.total)))
+                .collect();
+            self.launcher.state.status = if busy.len() == 1 {
+                let (i, speed, done, total) = busy[0];
+                let name = repos().get(i).map(|r| r.name).unwrap_or("应用");
+                let mut line = format!("正在下载 {name}… {}", human_speed(speed));
+                if total > 0 {
+                    line.push_str(&format!(
+                        " · {} / {}",
+                        human_size(done),
+                        human_size(total)
+                    ));
+                }
+                line
             } else {
-                format!("正在下载 {running} 个应用…")
+                let speed: f32 = busy.iter().map(|b| b.1).sum();
+                format!(
+                    "正在下载 {} 个应用… {}",
+                    busy.len(),
+                    human_speed(speed)
+                )
             };
         }
 
@@ -805,20 +882,12 @@ impl Launcher {
                 ui.painter().text(
                     pos2(WORDMARK_X + 19.0, mid + 0.5),
                     Align2::LEFT_CENTER,
-                    "ITUP",
+                    "ITUP LAUNCHER",
                     display(24.0),
                     p.text,
                 );
 
-                // A divider, then the suite name.
-                ui.painter().vline(247.0, 0.0..=47.0, line(p.border));
-                ui.painter().text(
-                    pos2(SUITE_X, mid),
-                    Align2::LEFT_CENTER,
-                    "GITUP APP SUITE",
-                    label(11.0),
-                    p.muted,
-                );
+                // Nothing more on the left: the wordmark stands alone.
             }
             Page::Settings => {
                 ui.painter().text(
@@ -1160,7 +1229,7 @@ impl Launcher {
                     313.0 + 289.0 * (rows - 1) as f32
                 }
             }
-            View::List => 36.0 + apps.len() as f32 * 56.0,
+            View::List => 44.0 + apps.len() as f32 * 70.0,
         };
 
         // The wheel moves the grid, in the same direction the Mac's own
@@ -1512,12 +1581,15 @@ impl Launcher {
             pos2(more_rect.min.x - 8.0, btn_y + btn_h),
         );
 
-        let mut main_left = main_rect.min.x;
+        // An app with an update waiting gets 打开 and 更新 side by side,
+        // each exactly half the row.
         let show_open = !busy && has_update && installed;
+        let half = (main_rect.width() - 8.0) / 2.0;
+        let mut main_left = main_rect.min.x;
         if show_open {
             let launch = Rect::from_min_max(
                 pos2(left_edge, btn_y),
-                pos2(left_edge + 88.0, btn_y + btn_h),
+                pos2(left_edge + half, btn_y + btn_h),
             );
             if action_button(
                 ui,
@@ -1539,16 +1611,31 @@ impl Launcher {
         );
 
         let label_text = self.button_label(idx).to_string();
-        if action_button(
-            ui,
-            painter,
-            open_rect,
-            egui::Id::unique(("open", app.id)),
-            &label_text,
-            15.0,
-            band,
-            p,
-        ) {
+        let update_waiting = has_update && installed && !busy;
+        let pressed = if update_waiting {
+            primary_button(
+                ui,
+                painter,
+                open_rect,
+                egui::Id::unique(("open", app.id)),
+                &label_text,
+                15.0,
+                band,
+                p,
+            )
+        } else {
+            action_button(
+                ui,
+                painter,
+                open_rect,
+                egui::Id::unique(("open", app.id)),
+                &label_text,
+                15.0,
+                band,
+                p,
+            )
+        };
+        if pressed {
             self.act(idx);
         }
         if busy && phase == JobPhase::Downloading && progress > 0.0 {
@@ -1923,116 +2010,118 @@ impl Launcher {
         painter.text(
             pos2(right_x, ry),
             Align2::LEFT_CENTER,
-            "取消勾选后不再检查该仓库的发布，也不在主界面显示。",
+            "列出的仓库会被检查发布并显示在主界面；点 × 从订阅中移除。",
             text(11.5),
             p.faint,
         );
-        ry += 24.0;
+        ry += 28.0;
         let list = repos();
         let sub_cols = 2;
         let sub_cell_w = (col_w - 12.0) / sub_cols as f32;
+        let mut slot = 0usize;
         for (i, repo) in list.iter().enumerate() {
-            let col = i % sub_cols;
-            let row = i / sub_cols;
+            if i >= self.state.subscribed.len() || !self.state.subscribed[i] {
+                continue;
+            }
+            let col = slot % sub_cols;
+            let row = slot / sub_cols;
+            slot += 1;
             let x = right_x + col as f32 * (sub_cell_w + 12.0);
-            let yy = ry + row as f32 * 26.0;
-            if i >= self.state.subscribed.len() {
-                break;
-            }
-            let checked = self.state.subscribed[i];
-            let box_r = Rect::from_min_size(pos2(x, yy - 9.0), vec2(18.0, 18.0));
-            painter.rect_stroke(box_r, radius(4), line(p.border), StrokeKind::Middle);
-            if checked {
-                painter.rect_filled(box_r, radius(4), p.text);
-                let c = box_r.center();
-                let s = Stroke::new(2.0, p.bg);
-                painter.line_segment(
-                    [egui::pos2(c.x - 4.0, c.y + 0.5), egui::pos2(c.x - 1.5, c.y + 3.5)],
-                    s,
-                );
-                painter.line_segment(
-                    [egui::pos2(c.x - 1.5, c.y + 3.5), egui::pos2(c.x + 4.5, c.y - 3.0)],
-                    s,
-                );
-            }
-            let custom = !catalog::is_builtin(repo.slug);
-            // Every subscribed row carries a cross at the end of its name:
-            // on a repository the person added it deletes the entry, on a
-            // built-in one it unsubscribes, which is the same thing from
-            // the window's point of view.
+            let yy = ry + row as f32 * 30.0;
             painter.text(
-                pos2(box_r.max.x + 8.0, box_r.center().y),
+                pos2(x, yy),
                 Align2::LEFT_CENTER,
                 repo.name,
                 text(13.0),
-                if checked { p.text } else { p.faint },
+                p.text,
             );
-            if custom || checked {
-                let name_w = measure(ui, repo.name, text(13.0));
-                let cx_x = (box_r.max.x + 8.0 + name_w + 8.0)
-                    .min(x + sub_cell_w - 22.0);
-                let cx = Rect::from_min_size(pos2(cx_x, yy - 10.0), vec2(20.0, 20.0));
-                let over = cx.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()));
-                painter.rect_stroke(
-                    cx,
-                    radius(4),
-                    if over {
-                        Stroke::new(1.0, p.amber)
-                    } else {
-                        line(p.border)
-                    },
-                    StrokeKind::Middle,
-                );
-                let c = cx.center();
-                let st = Stroke::new(1.4, if over { p.amber } else { p.muted });
-                painter.line_segment(
-                    [egui::pos2(c.x - 4.0, c.y - 4.0), egui::pos2(c.x + 4.0, c.y + 4.0)],
-                    st,
-                );
-                painter.line_segment(
-                    [egui::pos2(c.x + 4.0, c.y - 4.0), egui::pos2(c.x - 4.0, c.y + 4.0)],
-                    st,
-                );
-                let hit = cx.intersect(band).expand(3.0);
-                if hit.is_positive() {
-                    let resp = ui.interact(
-                        hit,
-                        egui::Id::unique(("settings-remove", repo.slug)),
-                        Sense::click(),
-                    );
-                    if resp.clicked() {
-                        if custom {
-                            self.remove_repository(i);
-                        } else {
-                            self.toggle_subscription(i);
-                        }
-                    }
-                }
-            }
-            let hit = Rect::from_min_size(
-                pos2(x, yy - 13.0),
-                vec2(sub_cell_w - 24.0, 26.0),
+            // The cross sits right after the name, and removes the row.
+            let name_w = measure(ui, repo.name, text(13.0));
+            let cx_x = (x + name_w + 10.0).min(x + sub_cell_w - 24.0);
+            let cx = Rect::from_min_size(pos2(cx_x, yy - 10.0), vec2(20.0, 20.0));
+            let over = cx.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()));
+            painter.rect_stroke(
+                cx,
+                radius(4),
+                if over {
+                    Stroke::new(1.0, p.amber)
+                } else {
+                    line(p.border)
+                },
+                StrokeKind::Middle,
             );
-            if hit.intersect(band).is_positive() {
+            let c = cx.center();
+            let st = Stroke::new(1.5, if over { p.amber } else { p.text });
+            painter.line_segment(
+                [pos2(c.x - 4.0, c.y - 4.0), pos2(c.x + 4.0, c.y + 4.0)],
+                st,
+            );
+            painter.line_segment(
+                [pos2(c.x + 4.0, c.y - 4.0), pos2(c.x - 4.0, c.y + 4.0)],
+                st,
+            );
+            let hit = cx.intersect(band).expand(4.0);
+            if hit.is_positive() {
                 let resp = ui.interact(
                     hit,
-                    ui.scope_id().with(("settings-sub", repo.id)),
+                    egui::Id::unique(("settings-remove", repo.slug)),
                     Sense::click(),
                 );
                 if resp.clicked() {
-                    self.toggle_subscription(i);
+                    if catalog::is_builtin(repo.slug) {
+                        self.toggle_subscription(i);
+                    } else {
+                        self.remove_repository(i);
+                    }
                 }
             }
         }
-        let sub_rows = list.len().div_ceil(sub_cols) as f32;
-        ry += sub_rows * 26.0 + 22.0;
+        let sub_rows = slot.div_ceil(sub_cols) as f32;
+        ry += sub_rows * 30.0 + 4.0;
+        // A way back for built-in repositories that were removed.
+        let removed_builtin = list.iter().enumerate().any(|(i, r)| {
+            catalog::is_builtin(r.slug)
+                && i < self.state.subscribed.len()
+                && !self.state.subscribed[i]
+        });
+        if removed_builtin {
+            let caption = "恢复默认仓库";
+            let r = Rect::from_min_size(
+                pos2(right_x, ry),
+                vec2(measure(ui, caption, text(12.0)) + 8.0, 20.0),
+            );
+            let over = r.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()));
+            painter.text(
+                pos2(r.min.x, r.center().y),
+                Align2::LEFT_CENTER,
+                caption,
+                text(12.0),
+                if over { p.accent } else { p.muted },
+            );
+            let resp = ui.interact(
+                r.intersect(band),
+                egui::Id::unique("settings-restore"),
+                Sense::click(),
+            );
+            if resp.clicked() {
+                self.settings.disabled.clear();
+                for i in 0..self.state.subscribed.len() {
+                    self.state.subscribed[i] = true;
+                }
+                state::save_settings(&self.settings);
+                self.spawn_meta_fetch_all();
+                self.state.status = "已恢复全部内置仓库".to_string();
+            }
+            ry += 28.0;
+        }
+        ry += 12.0;
 
         // The add box: a link or a slug goes in, the same rules take over
         // from there. The field has a fixed id so it keeps its focus (and
         // therefore keeps working) across frames, a click anywhere on the
         // box puts the caret in it, and a 粘贴 button reads the clipboard
         // itself so adding never depends on a keyboard shortcut working.
-        let add_w = col_w - 132.0;
+        let add_w = col_w - 178.0;
         let add_box = Rect::from_min_size(pos2(right_x, ry), vec2(add_w, 32.0));
         painter.rect_filled(add_box, 0, p.search_fill);
         let field_id = egui::Id::unique("settings-add-field");
@@ -2097,16 +2186,16 @@ impl Launcher {
 
         let paste_btn = Rect::from_min_size(
             pos2(add_box.max.x + 8.0, ry),
-            vec2(58.0, 32.0),
+            vec2(96.0, 32.0),
         );
         let add_btn = Rect::from_min_size(
             pos2(paste_btn.max.x + 8.0, ry),
-            vec2(58.0, 32.0),
+            vec2(64.0, 32.0),
         );
         let mut submit = field_resp.lost_focus()
             && ui.input(|i| i.key_pressed(egui::Key::Enter));
         for (rect, caption, id, paste) in [
-            (paste_btn, "粘贴", "settings-paste", true),
+            (paste_btn, "粘贴并添加", "settings-paste", true),
             (add_btn, "添加", "settings-add", false),
         ] {
             let hit = rect.intersect(band);
@@ -2140,11 +2229,15 @@ impl Launcher {
             );
             if clicked {
                 if paste {
-                    if let Some(text) = clipboard_text() {
-                        self.settings_input = text;
-                        ui.memory_mut(|m| m.request_focus(field_id));
-                    } else {
-                        self.settings_error = Some("剪贴板里没有文字".to_string());
+                    match clipboard_text() {
+                        Some(text) => {
+                            self.settings_input = text;
+                            submit = true;
+                        }
+                        None => {
+                            self.settings_error =
+                                Some("剪贴板里没有文字，先复制仓库链接".to_string());
+                        }
                     }
                 } else {
                     submit = true;
@@ -2217,18 +2310,19 @@ impl Launcher {
     /// 作者, then the action button and the little menu.
     fn list(&mut self, ui: &mut Ui, band: Rect, apps: &[usize], p: &Palette) {
         let painter = ui.painter().with_clip_rect(band);
-        let row_h = 52.0;
-        let head_h = 36.0;
+        // Roomy rows: the table was too tight to read at a glance.
+        let row_h = 62.0;
+        let head_h = 44.0;
         let right = band.max.x - RIGHT_GUTTER;
         // The right-hand column edges, working leftward from the window's
         // right edge: the little menu, the action button, then the author,
         // the date, the version and the status pill.
         let more_x = right - 37.0;
-        let act_x = more_x - 8.0 - 86.0;
-        let author_r = act_x - 22.0;
-        let date_r = author_r - 88.0;
-        let ver_r = date_r - 108.0;
-        let state_r = ver_r - 74.0;
+        let act_x = more_x - 12.0 - 92.0;
+        let author_r = act_x - 30.0;
+        let date_r = author_r - 104.0;
+        let ver_r = date_r - 124.0;
+        let state_r = ver_r - 90.0;
 
         // The header row, pinned above the rows.
         if band.height() > 40.0 {
@@ -2260,7 +2354,7 @@ impl Launcher {
         let scroll = self.state.scroll;
         for (i, &idx) in apps.iter().enumerate() {
             let app = &repos()[idx];
-            let y = band.min.y + head_h + i as f32 * (row_h + 4.0) - scroll;
+            let y = band.min.y + head_h + i as f32 * (row_h + 8.0) - scroll;
             if y + row_h < band.min.y + head_h || y > band.max.y {
                 continue;
             }
@@ -2373,16 +2467,31 @@ impl Launcher {
                 .unwrap_or((JobPhase::Downloading, 0.0));
             let label_text = self.button_label(idx).to_string();
             let btn = Rect::from_min_size(pos2(act_x, row.center().y - 13.0), vec2(86.0, 26.0));
-            if action_button(
-                ui,
-                &clip,
-                btn,
-                egui::Id::unique(("row", app.id)),
-                &label_text,
-                12.5,
-                band,
-                p,
-            ) {
+            let update_waiting = self.state.has_update(idx) && !busy;
+            let pressed = if update_waiting {
+                primary_button(
+                    ui,
+                    &clip,
+                    btn,
+                    egui::Id::unique(("row", app.id)),
+                    &label_text,
+                    12.5,
+                    band,
+                    p,
+                )
+            } else {
+                action_button(
+                    ui,
+                    &clip,
+                    btn,
+                    egui::Id::unique(("row", app.id)),
+                    &label_text,
+                    12.5,
+                    band,
+                    p,
+                )
+            };
+            if pressed {
                 self.act(idx);
             }
             if busy && phase == JobPhase::Downloading && progress > 0.0 {
@@ -2550,16 +2659,32 @@ impl Launcher {
         );
         if draw {
             let label_text = self.button_label(idx).to_string();
-            if action_button(
-                ui,
-                &painter,
-                main_rect,
-                egui::Id::unique(("dopen", app.id)),
-                &label_text,
-                15.0,
-                band,
-                p,
-            ) {
+            let update_waiting =
+                self.state.has_update(idx) && self.state.is_installed(idx) && !busy;
+            let pressed = if update_waiting {
+                primary_button(
+                    ui,
+                    &painter,
+                    main_rect,
+                    egui::Id::unique(("dopen", app.id)),
+                    &label_text,
+                    15.0,
+                    band,
+                    p,
+                )
+            } else {
+                action_button(
+                    ui,
+                    &painter,
+                    main_rect,
+                    egui::Id::unique(("dopen", app.id)),
+                    &label_text,
+                    15.0,
+                    band,
+                    p,
+                )
+            };
+            if pressed {
                 self.act(idx);
             }
             if busy && phase == JobPhase::Downloading && progress > 0.0 {
@@ -2923,17 +3048,34 @@ impl Launcher {
             p.faint,
         );
 
-        // The row of small marks at the far right.
-        let n = 8;
-        let mut x = bar.max.x - 26.0;
-        for i in (0..n).rev() {
-            let r = Rect::from_center_size(pos2(x, bar.center().y), vec2(20.0, 20.0));
-            footer_icon(ui.painter(), r, p.faint, p.bg, i);
-            let resp = ui.interact(r, ui.scope_id().with(("foot", i)), Sense::click());
-            if resp.clicked() {
-                self.state.status = "感谢支持 Gitup！".to_string();
-            }
-            x -= 30.0;
+        // One link, to the project itself; the other marks are gone.
+        let url = "https://github.com/zdx8";
+        let caption = "GITHUB";
+        let w = measure(ui, caption, label(11.0)) + 34.0;
+        let link = Rect::from_min_max(
+            pos2(bar.max.x - 20.0 - w, bar.center().y - 10.0),
+            pos2(bar.max.x - 20.0, bar.center().y + 10.0),
+        );
+        let hovered = link.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()));
+        ui.painter().text(
+            pos2(link.min.x, link.center().y),
+            Align2::LEFT_CENTER,
+            caption,
+            label(11.0),
+            if hovered { p.accent } else { p.faint },
+        );
+        arrow_out(
+            ui.painter(),
+            Rect::from_center_size(pos2(link.max.x - 8.0, link.center().y), vec2(11.0, 11.0)),
+            if hovered { p.accent } else { p.faint },
+        );
+        let resp = ui.interact(link, egui::Id::unique("footer-github"), Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if resp.clicked() {
+            let _ = std::process::Command::new("open").arg(url).spawn();
+            self.state.status = "已在浏览器打开项目地址".to_string();
         }
     }
 }
@@ -3047,6 +3189,73 @@ fn action_button(
         if hovered { p.accent } else { p.text },
     );
     clicked
+}
+
+/// The same button filled in: used for 更新, so a waiting update is the
+/// one thing on the card that shouts.
+#[allow(clippy::too_many_arguments)]
+fn primary_button(
+    ui: &mut Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    id: egui::Id,
+    caption: &str,
+    size: f32,
+    band: Rect,
+    p: &Palette,
+) -> bool {
+    let hit = rect.intersect(band);
+    let mut hovered = false;
+    let mut clicked = false;
+    if hit.is_positive() {
+        let resp = ui.interact(hit, id, Sense::click());
+        hovered = resp.hovered();
+        clicked = resp.clicked();
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    let lighten = |c: Color32| {
+        Color32::from_rgb(
+            c.r().saturating_add(28),
+            c.g().saturating_add(28),
+            c.b().saturating_add(28),
+        )
+    };
+    painter.rect_filled(
+        rect,
+        0,
+        if hovered { lighten(p.accent) } else { p.accent },
+    );
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        caption,
+        text(size),
+        p.bg,
+    );
+    clicked
+}
+
+/// A transfer rate, said the way a person reads it.
+fn human_speed(bytes_per_sec: f32) -> String {
+    if bytes_per_sec >= 1_048_576.0 {
+        format!("{:.1} MB/s", bytes_per_sec / 1_048_576.0)
+    } else if bytes_per_sec >= 1024.0 {
+        format!("{:.0} KB/s", bytes_per_sec / 1024.0)
+    } else {
+        format!("{:.0} B/s", bytes_per_sec)
+    }
+}
+
+/// A file size, for the progress the footer shows.
+fn human_size(bytes: u64) -> String {
+    let m = bytes as f32 / 1_048_576.0;
+    if m >= 1.0 {
+        format!("{m:.1} MB")
+    } else {
+        format!("{:.0} KB", bytes as f32 / 1024.0)
+    }
 }
 
 /// The Mac's clipboard as text, read straight from `pbpaste` so pasting
@@ -3378,6 +3587,12 @@ fn render_icon(size: usize) -> egui::ColorImage {
         (0.636, 0.772),
         (0.652, 0.905), // neck, bottom right
     ];
+    // The bird sits a little inside the plate, so its outline never runs
+    // into the rounded edge.
+    let shrink = |p: (f32, f32)| -> (f32, f32) {
+        (0.5 + (p.0 - 0.5) * 0.80, 0.5 + (p.1 - 0.5) * 0.80)
+    };
+    let head = head.map(shrink);
     // The engraved hatching across the neck and cheek.
     let hatches: [(f32, f32, f32, f32); 11] = [
         (0.200, 0.400, 0.268, 0.516),
@@ -3392,6 +3607,13 @@ fn render_icon(size: usize) -> egui::ColorImage {
         (0.440, 0.660, 0.508, 0.776),
         (0.498, 0.300, 0.556, 0.400),
     ];
+    let hatches = hatches.map(|(x0, y0, x1, y1)| {
+        let a = shrink((x0, y0));
+        let b = shrink((x1, y1));
+        (a.0, a.1, b.0, b.1)
+    });
+    let eye = shrink((0.452, 0.252));
+    let glint = shrink((0.466, 0.238));
     let dist_to_seg = |x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32| -> f32 {
         let (dx, dy) = (x1 - x0, y1 - y0);
         let len2 = dx * dx + dy * dy;
@@ -3409,11 +3631,13 @@ fn render_icon(size: usize) -> egui::ColorImage {
         let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
         outside + qx.max(qy).min(0.0) - r
     };
-    let top = (0.129f32, 0.694, 0.345); // #21B158
-    let bottom = (0.086f32, 0.600, 0.271); // #169945
+    // A white plate with a hairline rim, so the icon still reads on a
+    // white background; the bird keeps its black outline.
+    let top = (0.988f32, 0.988, 0.982);
+    let bottom = (0.957f32, 0.957, 0.949);
     let paper = (0.973f32, 0.973, 0.961);
     let ink = (0.075f32, 0.078, 0.082);
-    let outline_w = 0.0135;
+    let outline_w = 0.0105;
     let mut pixels = Vec::with_capacity(size * size);
     const N: usize = 4;
     for py in 0..size {
@@ -3424,18 +3648,24 @@ fn render_icon(size: usize) -> egui::ColorImage {
                 for sx in 0..N {
                     let x = (pxi as f32 + (sx as f32 + 0.5) / N as f32) / s;
                     let y = (py as f32 + (sy as f32 + 0.5) / N as f32) / s;
-                    if plate_sd(x, y) > 0.0 {
+                    let sd = plate_sd(x, y);
+                    if sd > 0.0 {
                         acc_a += 1.0;
                         continue;
                     }
-                    // The plate: a green that darkens gently downwards.
+                    // The plate: white, with a soft shadow towards the
+                    // bottom and a hairline rim just inside the edge.
                     let t = y.clamp(0.0, 1.0);
-                    let mut c = (
-                        top.0 + (bottom.0 - top.0) * t,
-                        top.1 + (bottom.1 - top.1) * t,
-                        top.2 + (bottom.2 - top.2) * t,
-                        1.0,
-                    );
+                    let mut c = if sd > -0.0038 {
+                        (0.878f32, 0.878, 0.870, 1.0)
+                    } else {
+                        (
+                            top.0 + (bottom.0 - top.0) * t,
+                            top.1 + (bottom.1 - top.1) * t,
+                            top.2 + (bottom.2 - top.2) * t,
+                            1.0,
+                        )
+                    };
                     // The bird, then its outline and hatching on top.
                     let near = x > 0.09 && x < 0.93 && y > 0.03 && y < 0.93;
                     if near {
@@ -3453,17 +3683,17 @@ fn render_icon(size: usize) -> egui::ColorImage {
                             c = (paper.0, paper.1, paper.2, 1.0);
                         }
                         // The eye: a black bead with a white glint.
-                        let de = ((x - 0.452).powi(2) + (y - 0.252).powi(2)).sqrt();
-                        if de < 0.043 {
+                        let de = ((x - eye.0).powi(2) + (y - eye.1).powi(2)).sqrt();
+                        if de < 0.0345 {
                             c = (ink.0, ink.1, ink.2, 1.0);
                         }
-                        let dg = ((x - 0.466).powi(2) + (y - 0.238).powi(2)).sqrt();
-                        if dg < 0.0125 {
+                        let dg = ((x - glint.0).powi(2) + (y - glint.1).powi(2)).sqrt();
+                        if dg < 0.0100 {
                             c = (paper.0, paper.1, paper.2, 1.0);
                         }
                         if inside {
                             for (x0, y0, x1, y1) in hatches {
-                                if dist_to_seg(x, y, x0, y0, x1, y1) < 0.0072 {
+                                if dist_to_seg(x, y, x0, y0, x1, y1) < 0.0058 {
                                     c = (ink.0, ink.1, ink.2, 1.0);
                                 }
                             }
