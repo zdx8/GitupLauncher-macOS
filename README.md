@@ -1,13 +1,37 @@
 # Gitup Launcher
 
-A launcher that looks after the macOS apps a handful of GitHub
-repositories publish on Releases: it sees what is installed, fetches
-each repository's newest release, and can install, update or open any
-of them from one window.
+A small macOS launcher for the apps a handful of GitHub repositories
+publish on Releases. It shows what is installed, reads each repository's
+newest release, and installs, updates or opens any of them from one
+window — no browser, no dragging DMGs around.
 
-## Open it
+![The launcher](docs/screenshot.png)
 
-Double-click **Gitup Launcher.app** in this folder.
+## Install
+
+Download `GitupLauncher-v<version>-arm64.zip` from
+[Releases](../../releases), unzip it, and drag **Gitup Launcher.app**
+into `/Applications`.
+
+The build is signed ad-hoc rather than with an Apple Developer ID, so the
+first launch needs the usual macOS move: right-click the app and choose
+**Open**, or clear the quarantine flag yourself:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Gitup Launcher.app"
+```
+
+Requires macOS 11 or newer on Apple silicon.
+
+## Build it
+
+```sh
+./bundle.sh
+```
+
+That builds the program and refreshes `Gitup Launcher.app` next to it.
+A Rust toolchain (1.85 or newer) and the Xcode command line tools are
+enough; there are no other build steps.
 
 ## The repositories it watches
 
@@ -15,67 +39,66 @@ Double-click **Gitup Launcher.app** in this folder.
 - zdx8/SyncEngine-macOS · zdx8/DataCopier-macOS · zdx8/FTPServer-macOS
 - hety0211/lumen-raw · JamesQiu2005/SpektraLab
 
+More can be added with the toolbar's **添加订阅** button: paste one
+`owner/repo` or a full GitHub link, or press **批量添加** and give it one
+per line. Subscriptions can be removed again from the settings page.
+
 ## What it does
 
-The window follows the Mac's own light or dark setting, so it looks at
-home whichever one you use. The layout is anchored to the window's live
-edges, so it holds together at any size, and the grid scrolls for real
-(wheel, thumb drag, or clicking the track) when the cards outgrow the
-window.
+The window follows the Mac's own light or dark setting. The layout is
+anchored to the window's live edges, so it holds at any size, and the
+grid scrolls for real (wheel, thumb drag, or clicking the track) when
+the cards outgrow the window. Double-clicking the top bar zooms the
+window; dragging the background moves it.
 
-- **Top bar** – the GITUP wordmark, the suite's name, and a cog at the
-  far right. The cog opens a menu: check for updates now, rescan the
-  installed apps, or read a line about the launcher itself.
-- **Toolbar** – a **排序** menu (by name or by newest release), a
-  **搜索应用** box that narrows the list as you type, and a switch
-  between the card grid and a plain list.
-- **The grid** – each app is one card: its version in colour (amber when
-  a newer release is waiting), a GITHUB link to its page, its tile, its
-  name, what it is for, when its newest release was published, and one
-  big button that says **打开** when the app is already here, **安装**
-  when it is not, and **更新** when a newer release is waiting.
-- **The little "…" button** – opens a small menu with the other things
-  you can do with that app: open it, install it again, or copy its link.
-- **The footer** – what the launcher is doing on the left ("正在检查更
-  新…"), and a row of links on the right.
+- **Toolbar** – **添加订阅** and **刷新订阅** on the left; a sort menu,
+  a search box that narrows the list as you type, and a switch between
+  the card grid and a plain list on the right.
+- **The grid** – one card per app: its tile, name, publisher, the
+  release's version and date, one line about what it is for, and a
+  single button that reads **打开** when the app is here, **安装** when
+  it is not, and **更新** when a newer release is waiting. Apps that are
+  not installed yet sit under a 未安装 heading, dimmed.
+- **The card menu** – GitHub 仓库, 更新说明, 所有版本, 选择版本 (install
+  any earlier release), then 卸载软件 and 删除订阅.
+- **One app's page** – the release history, the changelog, and arrows
+  that step through the other subscriptions.
+- **Settings** – appearance, when to check for updates, where installs
+  go, and the list of subscriptions with an × to drop one.
 
 Versions, dates and download links come live from the GitHub Releases
-API on worker threads. What is installed is read from each app bundle's
-own Info.plist. Installing downloads the release's macOS asset
-(preferring arm64, then universal; zip or dmg), unpacks it with ditto
-or mounts it with hdiutil, and replaces the copy in /Applications —
-moving the old one aside first and putting it back if anything fails.
-Clicking a running download cancels it.
+API on worker threads, so the window never waits on the network. What is
+installed is read from each app bundle's own Info.plist. Installing
+downloads the release's macOS asset (arm64 first, then universal; zip or
+dmg), unpacks it with ditto or mounts it with hdiutil, and replaces the
+copy in the install folder — moving the old one aside first and putting
+it back if anything fails. Clicking a running download cancels it.
 
-Set `GITHUB_TOKEN` in the environment if the API's anonymous rate limit
-(60 requests an hour) ever gets in the way.
+## Rate limits
 
-## Building it again
-
-Run `./bundle.sh` in this folder. It builds the program and refreshes
-the app bundle next to it.
-
-Cargo's usual download folder is not writable here, so the build needs to
-be told where to keep it:
+The GitHub API allows 60 anonymous requests an hour, which is only a few
+refreshes. Set a token to raise that to 5000:
 
 ```sh
-export CARGO_HOME="$PWD/.cargo-home"
-cargo build --release
+GITHUB_TOKEN=ghp_xxx ./target/release/gitup-launcher
 ```
 
 ## Looking at the other screens
 
-The program can open straight onto one of the other views, which is
-handy for taking pictures of them:
+The program can open straight onto one of its views, which is handy for
+taking pictures of them:
 
 ```sh
 ./target/release/gitup-launcher --demo list
-./target/release/gitup-launcher --demo menu
-./target/release/gitup-launcher --demo sort
-./target/release/gitup-launcher --demo search
+./target/release/gitup-launcher --demo detail
+./target/release/gitup-launcher --demo settings
 ```
 
-Setting `GITUP_THEME=light` (or `dark`) shows the other theme.
-
-Adding `--screenshot some-file.png` saves a picture of the window and
+Setting `GITUP_THEME=light` (or `dark`) shows the other appearance, and
+adding `--screenshot some-file.png` saves a picture of the window and
 quits.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The bundled typefaces are under the SIL
+Open Font License; see [NOTICE.md](NOTICE.md).

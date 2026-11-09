@@ -81,12 +81,20 @@ enum Demo {
     BatchRun,
 }
 
-/// The bulk importer: a list of addresses pasted or read from the
-/// clipboard, and what came of them.
+/// The importer: one address, or a whole list of them, and what came of
+/// the list when it was added.
 struct Batch {
+    /// What is in the one-line box, while the list box is closed.
+    single: String,
+    /// The list, in the many-line box.
     text: String,
     /// What happened, once the list has been read.
     report: Option<String>,
+    /// Whether the many-line box is showing instead of the one-line one.
+    expanded: bool,
+    /// Set when the box is opened, so the keyboard goes straight into it
+    /// and a paste lands there without a click.
+    focus: bool,
 }
 
 /// The version chooser: one app's releases, with the one being looked at.
@@ -140,8 +148,6 @@ struct Launcher {
     detail_expanded: bool,
     /// What the person has set, kept between runs.
     settings: state::Settings,
-    /// What is typed in the add-repository box on the settings page.
-    settings_input: String,
     /// Each repository's own description, kept on disk so the API is
     /// asked at most once per repository.
     descriptions: std::collections::BTreeMap<String, String>,
@@ -159,6 +165,15 @@ struct Launcher {
     picker: Option<Picker>,
     /// The bulk importer, when it is open.
     batch: Option<Batch>,
+    /// Whether the window is zoomed, as the window system last reported it.
+    /// Double-clicking the bar reads this to know which way to go.
+    window_zoomed: bool,
+    /// Where the search field sits, in window coordinates. A drag there is
+    /// a text selection, not a window drag.
+    search_rect: Rect,
+    /// Whether dragging the window's background has been switched off, so
+    /// the window system is only told when the answer changes.
+    drag_blocked: bool,
 }
 
 impl Launcher {
@@ -201,13 +216,15 @@ impl Launcher {
             detail_scroll: 0.0,
             detail_expanded: false,
             settings,
-            settings_input: String::new(),
             descriptions: load_descriptions(),
             releases: load_releases(),
             hover_demo: None,
             pending_scroll_end: false,
             picker: None,
             batch: None,
+            window_zoomed: false,
+            search_rect: Rect::NOTHING,
+            drag_blocked: false,
         };
         // A repository the person added is either in the list or deleted,
         // never merely switched off; a stale entry there used to hide it
@@ -352,13 +369,20 @@ impl Launcher {
 
     /// Rebuild every per-row table after the live list has changed shape.
     /// Any running download is cancelled first, so no late message lands
-    /// on the wrong row.
+    /// on the wrong row. The screen being looked at stays as it was — the
+    /// settings page, in particular, is where a repository gets removed
+    /// from — unless it was one app's page, whose index the change may
+    /// have moved.
     fn rebuild_repos(&mut self) {
         for repo in self.state.repos.iter() {
             if let Some(job) = &repo.job {
                 job.cancel.store(true, Ordering::SeqCst);
             }
         }
+        let page = match self.page {
+            Page::Detail(_) => Page::Grid,
+            other => other,
+        };
         let mut fresh = State::new();
         fresh.layout = self.state.layout;
         fresh.sort = self.state.sort;
@@ -369,7 +393,7 @@ impl Launcher {
         self.state = fresh;
         self.icons = repos().iter().map(|_| None).collect();
         self.icon_uv = repos().iter().map(|_| (0.0, 0.0, 1.0, 1.0)).collect();
-        self.page = Page::Grid;
+        self.page = page;
         self.spawn_meta_fetch_all();
         self.spawn_icon_load();
     }
@@ -721,51 +745,79 @@ struct App {
 }
 
 impl eframe::App for App {
-    /// Command-V while the settings page is open. The field is the only
-    /// text in the window, so the paste goes there whatever happens to have
-    /// the keyboard, and the field is given the focus afterwards. The
-    /// window manager's own paste event, when it arrives, is consumed here
-    /// so nothing is pasted twice.
-    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        if self.launcher.page != Page::Settings {
+    /// Command-V. The window's clipboard feature turns the key into a paste
+    /// event of its own; when it does not — the system clipboard refused, or
+    /// this build has no backend — the text is read here and put in its
+    /// place, so a field pastes either way and never twice. A paste goes to
+    /// whichever field has the keyboard; if none has it, the one field the
+    /// open page shows is given the focus first.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // Esc closes the importer, the way it closes any panel.
+        if self.launcher.batch.is_some()
+            && raw_input.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::Escape,
+                        pressed: true,
+                        ..
+                    }
+                )
+            })
+        {
+            self.launcher.batch = None;
+        }
+
+        let already_pasted = raw_input
+            .events
+            .iter()
+            .any(|e| matches!(e, egui::Event::Paste(_)));
+        if already_pasted {
             return;
         }
-        let mut pasted: Option<String> = None;
-        let mut cmd_v = false;
-        for event in &raw_input.events {
-            match event {
-                egui::Event::Paste(text) => pasted = Some(text.clone()),
+        let cmd_v = raw_input.events.iter().any(|e| {
+            matches!(
+                e,
                 egui::Event::Key {
                     key: egui::Key::V,
                     pressed: true,
                     modifiers,
                     ..
-                } if modifiers.command => cmd_v = true,
-                _ => {}
-            }
+                } if modifiers.command
+            )
+        });
+        if !cmd_v {
+            return;
         }
-        let text = match pasted {
-            Some(text) => Some(text),
-            None if cmd_v => clipboard_text(),
-            None => None,
-        };
-        let Some(text) = text else {
+        let Some(text) = clipboard_text() else {
             return;
         };
-        self.launcher.settings_input = text.trim().to_string();
-        ctx.memory_mut(|m| m.request_focus(egui::Id::unique("settings-add-field")));
         raw_input.events.retain(|event| {
-            !matches!(event, egui::Event::Paste(_))
-                && !matches!(
-                    event,
-                    egui::Event::Key {
-                        key: egui::Key::V,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } if modifiers.command
-                )
+            !matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::V,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.command
+            )
         });
+        let target = self.launcher.batch.as_ref().map(|batch| {
+            if batch.expanded {
+                egui::Id::unique("batch-field")
+            } else {
+                egui::Id::unique("batch-single")
+            }
+        });
+        if let Some(id) = target {
+            _ctx.memory_mut(|m| {
+                if m.focused().is_none() {
+                    m.request_focus(id);
+                }
+            });
+        }
+        raw_input.events.push(egui::Event::Paste(text));
     }
 
 
@@ -774,8 +826,29 @@ impl eframe::App for App {
         egui::Color32::from_rgb(0x12, 0x13, 0x16).to_normalized_gamma_f32()
     }
 
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Whether the window is zoomed, straight from the window system, so
+        // a double-click on the bar always goes the right way — even after
+        // the green button was used instead.
+        self.launcher.window_zoomed = frame
+            .winit_window()
+            .is_some_and(|window| window.is_maximized());
+
+        // A drag inside a text box must select text, not move the window.
+        // With the window movable by its background the window system takes
+        // every such drag, so the switch is turned off while the pointer is
+        // over a field — or while the importer, which is nothing but
+        // fields, is open. The window system is only told when the answer
+        // changes, not every frame.
+        let pointer = ctx.input(|i| i.pointer.hover_pos()).unwrap_or_default();
+        let over_text = self.launcher.batch.is_some()
+            || (self.launcher.page == Page::Grid && self.launcher.search_rect.contains(pointer));
+        if over_text != self.launcher.drag_blocked
+            && set_movable_by_background(!over_text)
+        {
+            self.launcher.drag_blocked = over_text;
+        }
         let dark = ctx.theme() == egui::Theme::Dark;
         let p = palette(dark);
 
@@ -837,13 +910,18 @@ impl eframe::App for App {
             Demo::Batch => {
                 self.launcher.open_batch();
                 if let Some(batch) = self.launcher.batch.as_mut() {
+                    batch.single = SAMPLE_LIST.lines().next().unwrap_or("").to_string();
                     batch.text = SAMPLE_LIST.to_string();
+                    // The default is the one-line box; the list is there for
+                    // looking at when the demo asks for it.
+                    batch.expanded = std::env::var("GITUP_BATCH_LIST").is_ok();
                 }
             }
             // The bulk importer, run at once.
             Demo::BatchRun => {
                 self.launcher.open_batch();
                 if let Some(batch) = self.launcher.batch.as_mut() {
+                    batch.single = SAMPLE_LIST.lines().next().unwrap_or("").to_string();
                     batch.text = SAMPLE_LIST.to_string();
                 }
                 self.launcher.import_repositories(SAMPLE_LIST);
@@ -932,6 +1010,21 @@ impl Launcher {
 
         let mid = 23.0;
 
+        // The bar is the window's handle: a double-click zooms it, the way
+        // a title bar does. The buttons are drawn after this, so they sit
+        // on top and keep their own clicks.
+        let zoom_area = Rect::from_min_max(
+            pos2(bar.min.x + 78.0, bar.min.y),
+            pos2(bar.max.x, bar.max.y),
+        );
+        let zoom_hit = ui.interact(zoom_area, egui::Id::unique("topbar-zoom"), Sense::click());
+        if zoom_hit.double_clicked() {
+            let zoomed = self.window_zoomed;
+            self.window_zoomed = !zoomed;
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(!zoomed));
+        }
+
         match self.page {
             Page::Grid => {
                 // The wordmark, sitting clear of the traffic lights: the
@@ -976,42 +1069,8 @@ impl Launcher {
             }
         }
 
-        // On the home screen, a box for adding a subscription sits just
-        // left of the cog. Clicking it opens the importer.
-        if self.page == Page::Grid {
-            let box_w = 200.0;
-            let add_box = Rect::from_min_max(
-                pos2(rect.max.x - 48.0 - 10.0 - box_w, mid - 13.0),
-                pos2(rect.max.x - 48.0 - 10.0, mid + 13.0),
-            );
-            let over = add_box
-                .contains(ui.input(|i| i.pointer.hover_pos()).unwrap_or_default());
-            ui.painter().rect_filled(add_box, 0, p.search_fill);
-            ui.painter().rect_stroke(
-                add_box,
-                0,
-                if over {
-                    Stroke::new(1.5, p.accent)
-                } else {
-                    line(p.border)
-                },
-                StrokeKind::Middle,
-            );
-            ui.painter().text(
-                pos2(add_box.min.x + 12.0, add_box.center().y),
-                Align2::LEFT_CENTER,
-                "添加订阅",
-                text(13.0),
-                if over { p.accent } else { p.faint },
-            );
-            let resp = ui.interact(add_box, egui::Id::unique("topbar-add"), Sense::click());
-            if resp.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if resp.clicked() {
-                self.open_batch();
-            }
-        }
+        // The bar itself carries nothing but the wordmark and the cog; the
+        // buttons that act on the subscriptions sit in the toolbar below.
 
         // A divider before the cog at the far right. It rides the right
         // edge, wherever the window's edge now is.
@@ -1090,20 +1149,31 @@ impl Launcher {
         if resp.clicked() {
             if let Page::Detail(idx) = self.page {
                 match which {
-                    0 => {
-                        let next = (idx + repos().len() - 1) % repos().len();
-                        self.open_page(next);
-                    }
-                    1 => {
-                        let next = (idx + 1) % repos().len();
-                        self.open_page(next);
-                    }
+                    0 => self.step_page(idx, false),
+                    1 => self.step_page(idx, true),
                     _ => self.page = Page::Grid,
                 }
             } else if which == 2 {
                 self.page = Page::Grid;
             }
         }
+    }
+
+    /// The app before or after this one in the order the grid shows them.
+    /// Only what is actually subscribed takes part, so the arrows never
+    /// open a repository that has been removed from the subscriptions.
+    fn step_page(&mut self, from: usize, forward: bool) {
+        let list = self.visible();
+        if list.is_empty() {
+            self.page = Page::Grid;
+            return;
+        }
+        let next = match list.iter().position(|&i| i == from) {
+            Some(at) if forward => list[(at + 1) % list.len()],
+            Some(at) => list[(at + list.len() - 1) % list.len()],
+            None => list[0],
+        };
+        self.open_page(next);
     }
 
     /// The settings page's close cell, at the far right of its header.
@@ -1115,28 +1185,72 @@ impl Launcher {
     // -------------------------------------------------------------- toolbar
 
     fn toolbar(&mut self, ui: &mut Ui, rect: Rect, p: &Palette) {
-        // The small square button at the far left. The picture puts it at
-        // 20..54 pt across and 66..99 pt down. One click asks GitHub about
-        // every repository again.
-        let btn = Rect::from_min_max(pos2(MARGIN, 66.0), pos2(54.0, 99.0));
-        ui.painter()
-            .rect_stroke(btn, 0, line(p.border), StrokeKind::Middle);
-        refresh_icon(
-            ui.painter(),
-            Rect::from_center_size(btn.center(), vec2(16.0, 16.0)),
-            p.muted,
-        );
-        let resp = ui.interact(btn, ui.scope_id().with("check-updates"), Sense::click());
-        if resp.hovered() {
-            ui.painter().rect_filled(btn, radius(4), p.surface);
-            refresh_icon(
-                ui.painter(),
-                Rect::from_center_size(btn.center(), vec2(16.0, 16.0)),
-                p.text,
+        // Two captioned buttons at the far left, side by side and the same
+        // size: add a subscription, then ask GitHub about every repository
+        // again. Each carries its caption, so what it does is plain without
+        // having to hover it.
+        for (slot, id, caption, adds) in [
+            (0.0f32, "toolbar-add", "添加订阅", true),
+            (116.0, "check-updates", "刷新订阅", false),
+        ] {
+            let btn = Rect::from_min_max(
+                pos2(MARGIN + slot, 66.0),
+                pos2(MARGIN + slot + 106.0, 99.0),
             );
-        }
-        if resp.clicked() {
-            self.spawn_meta_fetch_all();
+            let resp = ui.interact(btn, ui.scope_id().with(id), Sense::click());
+            let over = resp.hovered();
+            if over {
+                ui.painter().rect_filled(btn, radius(6), p.surface);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            ui.painter().rect_stroke(
+                btn,
+                radius(6),
+                if over {
+                    Stroke::new(1.5, p.accent)
+                } else {
+                    line(p.border)
+                },
+                StrokeKind::Middle,
+            );
+            let ink = if over { p.accent } else { p.muted };
+            let mark = Rect::from_center_size(
+                pos2(btn.min.x + 20.0, btn.center().y),
+                vec2(14.0, 14.0),
+            );
+            if adds {
+                // A plus sign, drawn rather than typed: two hairlines.
+                ui.painter().line_segment(
+                    [
+                        pos2(mark.center().x - 5.0, mark.center().y),
+                        pos2(mark.center().x + 5.0, mark.center().y),
+                    ],
+                    Stroke::new(1.4, ink),
+                );
+                ui.painter().line_segment(
+                    [
+                        pos2(mark.center().x, mark.center().y - 5.0),
+                        pos2(mark.center().x, mark.center().y + 5.0),
+                    ],
+                    Stroke::new(1.4, ink),
+                );
+            } else {
+                refresh_icon(ui.painter(), mark, ink);
+            }
+            ui.painter().text(
+                pos2(btn.min.x + 34.0, btn.center().y),
+                Align2::LEFT_CENTER,
+                caption,
+                text(12.5),
+                if over { p.accent } else { p.text },
+            );
+            if resp.clicked() {
+                if adds {
+                    self.open_batch();
+                } else {
+                    self.spawn_meta_fetch_all();
+                }
+            }
         }
 
         // On the right: the view switch, then searching, then sorting. All
@@ -1194,6 +1308,9 @@ impl Launcher {
             pos2(toggle.min.x - 6.0 - search_w, 66.0),
             pos2(toggle.min.x - 6.0, 66.0 + search_h),
         );
+        // Remembered, so the window-drag switch knows when the pointer is
+        // over this field.
+        self.search_rect = search_rect;
         // The picture's box is filled near-black inside its border.
         ui.painter()
             .rect_filled(search_rect, 0, p.search_fill);
@@ -2008,18 +2125,31 @@ impl Launcher {
         self.state.status = format!("已在浏览器打开 {} 的更新说明", repos()[idx].name);
     }
 
-    /// Open the bulk importer. Whatever is on the clipboard is put in it
-    /// straight away, so a list can be imported without typing at all.
+    /// Open the importer. Whatever is on the clipboard is put in it
+    /// straight away — its first address in the one-line box, the whole
+    /// text in the list box — so something can be added without typing.
     fn open_batch(&mut self) {
-        let text = clipboard_text().unwrap_or_default();
+        let clip = clipboard_text().unwrap_or_default();
+        let first = clip
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .unwrap_or_default()
+            .to_string();
         self.batch = Some(Batch {
-            text,
+            single: first,
+            text: clip,
             report: None,
+            expanded: false,
+            focus: true,
         });
     }
 
     /// Read every address in the box and subscribe to all of them at once.
-    fn import_repositories(&mut self, text: &str) {
+    /// It answers how many were added, how many were already there and how
+    /// many lines could not be read, so the caller knows whether anything
+    /// happened at all.
+    fn import_repositories(&mut self, text: &str) -> (usize, usize, usize) {
         let mut added = 0usize;
         let mut known = 0usize;
         let mut bad: Vec<String> = Vec::new();
@@ -2048,9 +2178,7 @@ impl Launcher {
         }
         state::save_settings(&self.settings);
         if added > 0 {
-            let page = self.page;
             self.rebuild_repos();
-            self.page = page;
             self.pending_scroll_end = true;
         }
         let mut report = format!("已导入 {added} 个仓库");
@@ -2068,117 +2196,249 @@ impl Launcher {
                 format!("{report}\n\n{}", bad.join("\n"))
             });
         }
+        (added, known, bad.len())
     }
 
-    /// The bulk importer: one box, many repositories.
+    /// The importer: a single address by default, or a whole list once
+    /// 批量添加 is chosen.
     fn draw_batch(&mut self, ui: &mut Ui, full: Rect, p: &Palette) {
         let Some(batch) = self.batch.as_mut() else {
             return;
         };
-        ui.interact(full, egui::Id::unique("batch-scrim"), Sense::click());
+        let scrim = ui.interact(full, egui::Id::unique("batch-scrim"), Sense::click());
         ui.painter()
-            .rect_filled(full, 0, Color32::from_black_alpha(140));
-        let rect = Rect::from_center_size(full.center(), vec2(640.0, 470.0));
+            .rect_filled(full, 0, Color32::from_black_alpha(150));
+
+        let expanded = batch.expanded;
+        // The panel is short while one address is being typed, taller when
+        // the list is showing, and a little taller again when a report of a
+        // failed attempt needs the room.
+        let height = if expanded {
+            460.0
+        } else if batch.report.is_some() {
+            300.0
+        } else {
+            240.0
+        };
+        let rect = Rect::from_center_size(full.center(), vec2(680.0, height));
         let painter = ui.painter().clone();
         let painter = &painter;
-        painter.rect_filled(rect, radius(6), p.bg);
-        painter.rect_stroke(rect, 0, line(p.border), StrokeKind::Middle);
+
+        // A soft shadow under the panel, so it sits above the page rather
+        // than being cut into it.
+        for (spread, alpha) in [(10.0f32, 18u8), (5.0, 26)] {
+            painter.rect_filled(
+                rect.translate(vec2(0.0, 6.0)).expand(spread),
+                radius(18),
+                Color32::from_black_alpha(alpha),
+            );
+        }
+        painter.rect_filled(rect, radius(12), p.bg);
+        painter.rect_stroke(rect, radius(12), line(p.border), StrokeKind::Middle);
+
+        // The head: what this is, and what it takes, on one line — the
+        // caption follows the title at its own size, and a close cell sits
+        // at the far right.
         painter.text(
-            pos2(rect.min.x + 28.0, rect.min.y + 34.0),
+            pos2(rect.min.x + 30.0, rect.min.y + 40.0),
             Align2::LEFT_CENTER,
             "添加订阅",
-            display(22.0),
+            display(23.0),
             p.text,
         );
+        let caption_x = rect.min.x + 30.0 + measure(ui, "添加订阅", display(23.0)) + 14.0;
         painter.text(
-            pos2(rect.min.x + 28.0, rect.min.y + 66.0),
+            pos2(caption_x, rect.min.y + 40.0),
             Align2::LEFT_CENTER,
-            "每行一个链接或 owner/repo；空行与以 # 开头的行会跳过。",
+            if expanded {
+                "每行一个链接或 owner/repo；空行与以 # 开头的行会跳过。"
+            } else {
+                "粘贴一个链接或 owner/repo，回车即可添加。"
+            },
             text(12.5),
             p.faint,
         );
-
-        let box_rect = Rect::from_min_size(
-            pos2(rect.min.x + 28.0, rect.min.y + 86.0),
-            vec2(rect.width() - 56.0, 210.0),
+        let close = Rect::from_center_size(
+            pos2(rect.max.x - 44.0, rect.min.y + 40.0),
+            vec2(26.0, 26.0),
         );
-        painter.rect_filled(box_rect, 0, p.search_fill);
-        painter.rect_stroke(box_rect, 0, line(p.border), StrokeKind::Middle);
-        if batch.text.is_empty() {
+        if expanded {
+            let count = batch
+                .text
+                .lines()
+                .filter(|line| {
+                    let line = line.trim();
+                    !line.is_empty() && !line.starts_with('#')
+                })
+                .count();
             painter.text(
-                pos2(box_rect.min.x + 12.0, box_rect.min.y + 14.0),
+                pos2(close.min.x - 14.0, rect.min.y + 40.0),
+                Align2::RIGHT_CENTER,
+                format!("{count} 个地址"),
+                label(11.5),
+                p.faint,
+            );
+        }
+        let close_hit = ui.interact(close, egui::Id::unique("batch-close"), Sense::click());
+        if close_hit.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            painter.rect_filled(close, radius(4), p.surface);
+        }
+        let cross = Stroke::new(1.5, if close_hit.hovered() { p.text } else { p.muted });
+        let centre = close.center();
+        painter.line_segment(
+            [
+                pos2(centre.x - 5.0, centre.y - 5.0),
+                pos2(centre.x + 5.0, centre.y + 5.0),
+            ],
+            cross,
+        );
+        painter.line_segment(
+            [
+                pos2(centre.x + 5.0, centre.y - 5.0),
+                pos2(centre.x - 5.0, centre.y + 5.0),
+            ],
+            cross,
+        );
+        if close_hit.clicked() {
+            self.batch = None;
+            return;
+        }
+
+        // The box itself. Its hairline takes the accent while it holds the
+        // keyboard, so it is plain where a paste will land.
+        let box_rect = Rect::from_min_size(
+            pos2(rect.min.x + 30.0, rect.min.y + 76.0),
+            vec2(rect.width() - 60.0, if expanded { 196.0 } else { 46.0 }),
+        );
+        let field_id = if expanded {
+            egui::Id::unique("batch-field")
+        } else {
+            egui::Id::unique("batch-single")
+        };
+        let focused = ui.memory(|m| m.has_focus(field_id));
+        painter.rect_filled(box_rect, radius(8), p.search_fill);
+        painter.rect_stroke(
+            box_rect,
+            radius(8),
+            if focused {
+                Stroke::new(1.5, p.accent)
+            } else {
+                line(p.border)
+            },
+            StrokeKind::Middle,
+        );
+
+        // The field sits inside the box, with a little padding on each side.
+        let inner = if expanded {
+            Rect::from_min_max(
+                pos2(box_rect.min.x + 12.0, box_rect.min.y + 10.0),
+                pos2(box_rect.max.x - 12.0, box_rect.max.y - 10.0),
+            )
+        } else {
+            Rect::from_min_max(
+                pos2(box_rect.min.x + 12.0, box_rect.center().y - 10.0),
+                pos2(box_rect.max.x - 12.0, box_rect.center().y + 10.0),
+            )
+        };
+        let empty = if expanded {
+            batch.text.is_empty()
+        } else {
+            batch.single.is_empty()
+        };
+        if empty {
+            painter.text(
+                pos2(inner.min.x + 2.0, inner.center().y),
                 Align2::LEFT_CENTER,
-                "https://github.com/owner/repo（一行一个）",
+                if expanded {
+                    "https://github.com/owner/repo（一行一个）"
+                } else {
+                    "https://github.com/owner/repo"
+                },
                 text(12.0),
                 p.faint,
             );
         }
         let mut child = ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(Rect::from_min_max(
-                    pos2(box_rect.min.x + 8.0, box_rect.min.y + 6.0),
-                    pos2(box_rect.max.x - 8.0, box_rect.max.y - 6.0),
-                ))
-                .id_salt("batch-text"),
+                .max_rect(inner)
+                .id_salt(if expanded { "batch-text" } else { "batch-one" }),
         );
-        child.add_sized(
-            vec2(box_rect.width() - 16.0, box_rect.height() - 12.0),
+        // The keyboard goes into the box as soon as it opens, so a paste
+        // lands without a click first.
+        if batch.focus {
+            batch.focus = false;
+            ui.ctx().memory_mut(|m| m.request_focus(field_id));
+        }
+        let edit = if expanded {
             TextEdit::multiline(&mut batch.text)
-                .id(egui::Id::unique("batch-field"))
+                .id(field_id)
                 .text_color(p.text)
                 .frame(egui::Frame::NONE)
-                .desired_width(box_rect.width() - 16.0),
+                .desired_width(inner.width())
+        } else {
+            TextEdit::singleline(&mut batch.single)
+                .id(field_id)
+                .text_color(p.text)
+                .frame(egui::Frame::NONE)
+                .desired_width(inner.width())
+        };
+        child.add_sized(inner.size(), edit);
+
+        // The way between the two boxes.
+        let link_y = box_rect.max.y + 24.0;
+        let caption = if expanded {
+            "－ 收起批量输入"
+        } else {
+            "＋ 批量添加"
+        };
+        let link = Rect::from_min_size(
+            pos2(rect.min.x + 30.0, link_y - 11.0),
+            vec2(measure(ui, caption, text(12.5)) + 8.0, 22.0),
+        );
+        let link_hit = ui.interact(link, egui::Id::unique("batch-toggle"), Sense::click());
+        if link_hit.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        painter.text(
+            pos2(link.min.x, link.center().y),
+            Align2::LEFT_CENTER,
+            caption,
+            text(12.5),
+            if link_hit.hovered() { p.accent } else { p.muted },
         );
 
-        // What came of the last attempt, line by line.
+        // What came of the last attempt, under the link.
         if let Some(report) = &batch.report {
+            let colour = if report.contains("无法识别") {
+                p.amber
+            } else {
+                p.muted
+            };
+            let mut lines: Vec<&str> = report.lines().collect();
+            if lines.len() > 4 {
+                lines.truncate(3);
+                lines.push("…");
+            }
             let galley = painter.layout(
-                report.clone(),
+                lines.join("\n"),
                 text(12.0),
-                p.muted,
-                rect.width() - 56.0,
+                colour,
+                rect.width() - 60.0,
             );
-            painter.galley(
-                pos2(rect.min.x + 28.0, box_rect.max.y + 12.0),
-                galley,
-                p.muted,
-            );
+            painter.galley(pos2(rect.min.x + 30.0, link_y + 16.0), galley, colour);
         }
 
-        let close = Rect::from_min_size(
-            pos2(rect.min.x + 28.0, rect.max.y - 58.0),
-            vec2(110.0, 38.0),
+        // The foot: one button, 添加. The panel is closed by the close cell,
+        // a click on the page outside it, or Esc.
+        let import = Rect::from_min_size(
+            pos2(rect.max.x - 30.0 - 104.0, rect.max.y - 56.0),
+            vec2(104.0, 38.0),
         );
-        if action_button(ui, painter, close, egui::Id::unique("batch-close"), "关闭", 13.0, full, p) {
-            self.batch = None;
-            return;
-        }
-        let from_clip = Rect::from_min_max(
-            pos2(rect.max.x - 28.0 - 158.0 - 150.0, rect.max.y - 58.0),
-            pos2(rect.max.x - 28.0 - 158.0, rect.max.y - 20.0),
-        );
-        if action_button(
-            ui,
-            painter,
-            from_clip,
-            egui::Id::unique("batch-clip"),
-            "从剪贴板读取",
-            12.5,
-            full,
-            p,
-        ) {
-            if let Some(text) = clipboard_text() {
-                batch.text = text;
-                batch.report = None;
-            } else {
-                batch.report = Some("剪贴板里没有文字".to_string());
-            }
-        }
-        let import = Rect::from_min_max(
-            pos2(rect.max.x - 28.0 - 150.0, rect.max.y - 58.0),
-            pos2(rect.max.x - 28.0, rect.max.y - 20.0),
-        );
-        if primary_button(
+        let entered = !expanded
+            && focused
+            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let clicked = primary_button(
             ui,
             painter,
             import,
@@ -2187,9 +2447,52 @@ impl Launcher {
             13.0,
             full,
             p,
-        ) {
-            let text = batch.text.clone();
-            self.import_repositories(&text);
+        );
+
+        if link_hit.clicked() {
+            batch.expanded = !expanded;
+            if batch.expanded {
+                if batch.text.trim().is_empty() {
+                    batch.text = batch.single.clone();
+                }
+            } else {
+                batch.single = batch
+                    .text
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty() && !line.starts_with('#'))
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            batch.focus = true;
+            batch.report = None;
+            return;
+        }
+
+        if clicked || entered {
+            let text = if expanded {
+                batch.text.clone()
+            } else {
+                batch.single.clone()
+            };
+            let (added, known, bad) = self.import_repositories(&text);
+            // Done: the panel closes itself, and the footer says what
+            // happened. It stays only when every line was unreadable, so
+            // the mistake can be fixed where it was typed.
+            if added + known > 0 || bad == 0 {
+                self.batch = None;
+            }
+            return;
+        }
+
+        // A click on the page outside the panel closes it.
+        if scrim.clicked() {
+            let inside = ui
+                .input(|i| i.pointer.interact_pos())
+                .is_some_and(|at| rect.contains(at));
+            if !inside {
+                self.batch = None;
+            }
         }
     }
 
@@ -3776,6 +4079,70 @@ fn clipboard_text() -> Option<String> {
     }
 }
 
+/// Switches the window system's "a drag on the background moves the
+/// window" on or off, while the window is already open. It has to be off
+/// while the pointer is over a text box: with it on, AppKit claims the drag
+/// before the field ever sees it, and selecting text moves the window
+/// instead.
+#[cfg(target_os = "macos")]
+fn set_movable_by_background(movable: bool) -> bool {
+    use std::ffi::{c_char, c_void};
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    // SAFETY: `objc_msgSend` is called through function pointers whose
+    // signatures match the messages being sent (two ids in, an id back;
+    // two ids and a BOOL in, nothing back), which is how the Objective-C
+    // runtime is meant to be reached.
+    unsafe {
+        let sel = |name: &[u8]| sel_registerName(name.as_ptr() as *const c_char);
+        let get: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let app = get(
+            objc_getClass(b"NSApplication\0".as_ptr() as *const c_char),
+            sel(b"sharedApplication\0"),
+        );
+        if app.is_null() {
+            return false;
+        }
+        // The key window while the app is in use; the main one, then the
+        // first window in the list, when it is not.
+        let mut window = get(app, sel(b"keyWindow\0"));
+        if window.is_null() {
+            window = get(app, sel(b"mainWindow\0"));
+        }
+        if window.is_null() {
+            let windows = get(app, sel(b"windows\0"));
+            if !windows.is_null() {
+                window = get(windows, sel(b"firstObject\0"));
+            }
+        }
+        if window.is_null() {
+            return false;
+        }
+        let set: extern "C" fn(*mut c_void, *mut c_void, bool) =
+            std::mem::transmute(objc_msgSend as *const ());
+        set(window, sel(b"setMovableByWindowBackground:\0"), movable);
+        if std::env::var("GITUP_DEBUG_DRAG").is_ok() {
+            let read: extern "C" fn(*mut c_void, *mut c_void) -> bool =
+                std::mem::transmute(objc_msgSend as *const ());
+            let now = read(window, sel(b"isMovableByWindowBackground\0"));
+            eprintln!("movable_by_background -> {movable}, reads back {now}");
+        }
+        true
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_movable_by_background(_movable: bool) -> bool {
+    false
+}
+
 /// A string shortened with an ellipsis until it fits the given width.
 fn fit_text(ui: &Ui, text_in: &str, font: egui::FontId, max_w: f32) -> String {
     if measure(ui, text_in, font.clone()) <= max_w {
@@ -3878,6 +4245,10 @@ fn main() -> eframe::Result<()> {
         .with_titlebar_shown(false)
         .with_titlebar_buttons_shown(true)
         .with_fullsize_content_view(true)
+        // The whole background drags the window, the way the original's
+        // does. It is switched off at runtime while the pointer is over a
+        // text box, so a drag there selects text instead of moving the
+        // window (see `set_movable_by_background`).
         .with_movable_by_background(true);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
@@ -3969,6 +4340,42 @@ impl eframe::App for ScreenshotApp {
         }
         // The real app's hook still runs, so a test exercises the real path.
         self.inner.raw_input_hook(ctx, raw_input);
+        // A test hook for the bar's double-click: two clicks in quick
+        // succession on the empty part of the bar. A picture taken after
+        // them is the size of the screen when the zoom worked; the value
+        // says how many double-clicks to make, so the way back can be
+        // checked as well.
+        if let Ok(times) = std::env::var("GITUP_DBLCLICK_TEST") {
+            let times: u32 = times.parse().unwrap_or(1);
+            let at = egui::pos2(600.0, 23.0);
+            for k in 0..times {
+                // Far enough apart that the second pair is a fresh double
+                // click rather than the third click of the first one.
+                let base = 12 + 32 * k;
+                match self.pass {
+                    pass if pass == base => {
+                        raw_input.events.push(egui::Event::PointerMoved(at))
+                    }
+                    pass if pass == base + 1 || pass == base + 4 => raw_input
+                        .events
+                        .push(egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::default(),
+                        }),
+                    pass if pass == base + 2 || pass == base + 5 => raw_input
+                        .events
+                        .push(egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::default(),
+                        }),
+                    _ => {}
+                }
+            }
+        }
         self.pass += 1;
         let click = |pass: u32, pos: egui::Pos2, raw_input: &mut egui::RawInput| {
             if self.pass == pass {
@@ -3999,34 +4406,60 @@ impl eframe::App for ScreenshotApp {
             return;
         }
         if std::env::var("GITUP_UI_TEST").is_ok() {
-            if self.pass == 20 {
-                raw_input
-                    .events
-                    .push(egui::Event::PointerMoved(egui::pos2(720.0, 537.0)));
-            }
-            click(21, egui::pos2(720.0, 537.0), raw_input);
-            if self.pass == 26 {
-                raw_input.events.push(egui::Event::Text(
-                    "https://github.com/diamondfsd/luna-ai-cut".to_string(),
-                ));
-            }
-            click(40, egui::pos2(1042.0, 537.0), raw_input);
+            // A click on the importer's 添加 button: the panel should close
+            // itself and the footer say what happened.
+            click(20, egui::pos2(818.0, 463.0), raw_input);
         }
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
-        // A test hook: with GITUP_TYPE_TEST set, the add-repository field is
-        // focused and fed some text on one frame, so a picture can show
-        // whether it really takes keystrokes.
+        // A test hook: with GITUP_DEL_TEST set, a repository the person
+        // added is removed on one frame, so a picture can show whether the
+        // settings page stays where it is.
+        if std::env::var("GITUP_DEL_TEST").is_ok() && self.frame == 6 {
+            let custom = repos()
+                .iter()
+                .position(|repo| !catalog::is_builtin(repo.slug));
+            if let Some(idx) = custom {
+                self.inner.launcher.remove_repository(idx);
+            }
+        }
+        // A test hook: with GITUP_NAV_TEST set, one built-in subscription is
+        // switched off and the detail page's arrows are walked, printing
+        // where they land — a removed subscription must never appear.
+        if std::env::var("GITUP_NAV_TEST").is_ok() && self.frame == 6 {
+            self.inner.launcher.toggle_subscription(1);
+            let mut idx = 0usize;
+            let mut trail = Vec::new();
+            for _ in 0..14 {
+                self.inner.launcher.step_page(idx, true);
+                if let Page::Detail(next) = self.inner.launcher.page {
+                    idx = next;
+                    trail.push(format!(
+                        "{}({})",
+                        repos()[next].name,
+                        if self.inner.launcher.state.subscribed[next] {
+                            "sub"
+                        } else {
+                            "NOT"
+                        }
+                    ));
+                }
+            }
+            eprintln!("nav walk: {}", trail.join(" → "));
+            self.inner.launcher.toggle_subscription(1);
+        }
+        // A test hook: with GITUP_TYPE_TEST set, the search field is focused
+        // and fed some text on one frame, so a picture can show whether it
+        // really takes keystrokes.
         if std::env::var("GITUP_TYPE_TEST").is_ok() {
             self.frame += 1;
             if self.frame == 20 {
-                let id = egui::Id::unique("settings-add-field");
+                let id = egui::Id::unique("toolbar-search");
                 ui.ctx().memory_mut(|m| m.request_focus(id));
                 ui.ctx().input_mut(|i| {
-                    i.events.push(egui::Event::Text(
-                        "diamondfsd/luna-ai-cut".to_string(),
-                    ));
+                    i.events
+                        .push(egui::Event::Text("luna".to_string()));
                 });
             }
             self.frame -= 1;
