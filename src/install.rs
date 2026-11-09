@@ -68,6 +68,27 @@ pub fn open_app(bundle: &str) -> Result<(), String> {
     run(Command::new("open").args(["-a", bundle])).map(|_| ())
 }
 
+/// Move the installed `<bundle>.app` to the Bin. The subscription is a
+/// setting inside the launcher, so it is untouched: the app goes, the entry
+/// stays, and it can be installed again from the same card.
+pub fn uninstall_app(bundle: &str) -> Result<(), String> {
+    for dir in app_dirs() {
+        let app = dir.join(format!("{bundle}.app"));
+        if !app.exists() {
+            continue;
+        }
+        // Through the Finder, so the bundle lands in the Bin the way a
+        // person expects, and can be put back if they change their mind.
+        let script = format!(
+            "tell application \"Finder\" to delete POSIX file \"{}\"",
+            app.display()
+        );
+        run(Command::new("osascript").arg("-e").arg(&script))?;
+        return Ok(());
+    }
+    Err("没有在本机找到该应用".to_string())
+}
+
 /// The installed app's own icon, turned into PNG bytes by sips. The name
 /// in the bundle's Info.plist may or may not carry the `.icns` suffix, so
 /// both spellings are tried; a bundle without an icon answers `None`.

@@ -45,6 +45,8 @@ const FOOTER_H: f32 = 34.0;
 const WORDMARK_X: f32 = 92.0;
 /// The height of the strip at the top of a card (its rule is at 163 pt).
 const CARD_HEAD_H: f32 = 39.0;
+/// The height of the 未安装 heading in the grid.
+const SECTION_H: f32 = 42.0;
 /// The width of one card's app tile.
 const TILE: f32 = 56.0;
 /// How many cards sit side by side.
@@ -68,6 +70,18 @@ enum Demo {
     Detail,
     Settings,
     Hover,
+    Picker,
+}
+
+/// The version chooser: one app's releases, with the one being looked at.
+struct Picker {
+    idx: usize,
+    loading: bool,
+    error: Option<String>,
+    list: Vec<github::ReleaseInfo>,
+    chosen: usize,
+    /// Whether the drop-down is open.
+    open: bool,
 }
 
 /// What the window is showing: the grid, one app's page, or settings.
@@ -127,6 +141,8 @@ struct Launcher {
     /// Set after a repository is added, so the grid scrolls to the end and
     /// the new card is actually on screen.
     pending_scroll_end: bool,
+    /// The version chooser, when it is open.
+    picker: Option<Picker>,
 }
 
 impl Launcher {
@@ -175,7 +191,16 @@ impl Launcher {
             hover_demo: None,
             settings_error: None,
             pending_scroll_end: false,
+            picker: None,
         };
+        // A repository the person added is either in the list or deleted,
+        // never merely switched off; a stale entry there used to hide it
+        // while still answering "already subscribed" when it was added back.
+        let custom = launcher.settings.custom.clone();
+        launcher
+            .settings
+            .disabled
+            .retain(|d| !custom.iter().any(|c| c == d));
         for (i, repo) in repos().iter().enumerate() {
             launcher.state.subscribed[i] = !launcher.settings.disabled.iter().any(|d| d == repo.id);
             // What was read last time is shown at once, so the versions and
@@ -371,6 +396,8 @@ impl Launcher {
                 self.settings_error = None;
                 let slug = repos()[idx].slug.to_string();
                 self.settings.custom.push(slug.clone());
+                self.settings.disabled.retain(|d| d != &slug);
+                self.state.subscribed[idx] = true;
                 state::save_settings(&self.settings);
                 self.sync_arrays();
                 let installed = install::installed_version(repos()[idx].bundle);
@@ -394,6 +421,36 @@ impl Launcher {
         }
     }
 
+    /// Move the installed app to the Bin. The subscription stays, so the
+    /// card turns back into 安装 and the app can be put back with one click.
+    fn uninstall(&mut self, idx: usize) {
+        for repo in self.state.repos.iter() {
+            if let Some(job) = &repo.job {
+                job.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+        let name = repos()[idx].name;
+        match install::uninstall_app(repos()[idx].bundle) {
+            Ok(()) => {
+                self.state.rescan_installed();
+                self.state.status = format!("已卸载 {name}（订阅保留）");
+            }
+            Err(e) => self.state.status = format!("卸载 {name} 失败: {e}"),
+        }
+    }
+
+    /// Drop the subscription only: whatever is installed stays installed.
+    fn delete_subscription(&mut self, idx: usize) {
+        let name = repos()[idx].name;
+        let builtin = catalog::is_builtin(repos()[idx].slug);
+        if builtin {
+            self.toggle_subscription(idx);
+        } else {
+            self.remove_repository(idx);
+        }
+        self.state.status = format!("已删除订阅 {name}（已安装的 {name}.app 保留）");
+    }
+
     /// Remove a repository the person added. Built-ins are only ever
     /// switched off, never deleted.
     fn remove_repository(&mut self, idx: usize) {
@@ -408,6 +465,7 @@ impl Launcher {
         let slug = list[idx].slug.to_string();
         catalog::remove_custom(&slug);
         self.settings.custom.retain(|s| s != &slug);
+        self.settings.disabled.retain(|d| d != &slug);
         state::save_settings(&self.settings);
         self.rebuild_repos();
         self.state.status = format!("已移除订阅 {slug}");
@@ -560,6 +618,20 @@ impl Launcher {
                     self.icons[idx] = Some(texture);
                     self.icon_uv[idx] = uv;
                 }
+                Msg::Versions { idx, result } => {
+                    if let Some(picker) = self.picker.as_mut() {
+                        if picker.idx == idx {
+                            picker.loading = false;
+                            match result {
+                                Ok(list) => {
+                                    picker.list = list;
+                                    picker.chosen = 0;
+                                }
+                                Err(e) => picker.error = Some(e),
+                            }
+                        }
+                    }
+                }
                 Msg::Description { slug, text } => {
                     self.descriptions.insert(slug, text);
                     save_descriptions(&self.descriptions);
@@ -598,6 +670,15 @@ impl Launcher {
                 format!("{} 的最新发布里没有 macOS 安装包", repos()[idx].name);
             return;
         };
+        self.start_download(idx, asset);
+    }
+
+    /// Download and install one particular asset. The version chooser uses
+    /// this to install a release that is not the newest.
+    fn start_download(&mut self, idx: usize, asset: github::MacAsset) {
+        if self.state.busy(idx) {
+            return;
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         self.state.repos[idx].job = Some(state::Job {
             progress: 0.0,
@@ -627,9 +708,7 @@ impl Launcher {
                 install::install_asset(&file, asset.kind, &bundle)
             });
             let _ = std::fs::remove_file(&file);
-            let result = result.map(|_| {
-                install::installed_version(&bundle).unwrap_or_default()
-            });
+            let result = result.map(|_| install::installed_version(&bundle).unwrap_or_default());
             let _ = tx.send(Msg::Done { idx, result });
             ctx.request_repaint();
         });
@@ -795,6 +874,8 @@ impl eframe::App for App {
             // A card held under the pointer, so the hover frame can be
             // looked at without a mouse.
             Demo::Hover => self.launcher.hover_demo = Some(0),
+            // The version chooser for the first app.
+            Demo::Picker => self.launcher.open_versions(0),
             Demo::None => {}
         }
 
@@ -859,6 +940,8 @@ impl eframe::App for App {
                 if let Some((rect, idx)) = self.launcher.pending_menu.take() {
                     self.launcher.draw_menu(ui, rect, idx, body, &p);
                 }
+                // The version chooser sits above everything else.
+                self.launcher.draw_picker(ui, full, &p);
             });
     }
 }
@@ -1226,14 +1309,7 @@ impl Launcher {
 
         // How tall the whole thing is, before the window clips it.
         let content_h = match self.state.layout {
-            View::Grid => {
-                let rows = apps.len().div_ceil(COLUMNS);
-                if rows == 0 {
-                    0.0
-                } else {
-                    313.0 + 289.0 * (rows - 1) as f32
-                }
-            }
+            View::Grid => self.grid_height(&apps),
             View::List => 44.0 + apps.len() as f32 * 70.0,
         };
 
@@ -1339,28 +1415,109 @@ impl Launcher {
     fn grid(&mut self, ui: &mut Ui, band: Rect, apps: &[usize], p: &Palette) {
         let col_w = (band.width() - MARGIN - RIGHT_GUTTER) / COLUMNS as f32;
         let scroll = self.state.scroll;
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        // What is on this Mac comes first; everything else is gathered
+        // under one 未安装 heading and drawn quietly, until the pointer
+        // arrives and gives it its colour back.
+        let installed: Vec<usize> = apps
+            .iter()
+            .copied()
+            .filter(|&i| self.state.is_installed(i))
+            .collect();
+        let missing: Vec<usize> = apps
+            .iter()
+            .copied()
+            .filter(|&i| !self.state.is_installed(i))
+            .collect();
 
-        let mut row_top = band.min.y - scroll;
-        for (i, &idx) in apps.iter().enumerate() {
-            let col = i % COLUMNS;
-            let row = i / COLUMNS;
-            // The picture's rows: the first is 313 pt tall and the rest
-            // 289 pt.
-            let row_h = if row == 0 { 313.0 } else { 289.0 };
-            let x = MARGIN + col as f32 * col_w;
-            // The picture's grid stops just short of the scrollbar, and
-            // the last column has no rule down its right-hand side.
-            let w = if col == COLUMNS - 1 {
-                col_w - 2.5
-            } else {
-                col_w
-            };
-            let card = Rect::from_min_size(pos2(x, row_top), vec2(w, row_h));
-            self.card(ui, card, idx, band, p);
-            if col == COLUMNS - 1 || i == apps.len() - 1 {
-                row_top += row_h;
+        let mut top = band.min.y - scroll;
+        let mut first_row = true;
+        for (group, dim) in [(&installed, false), (&missing, true)] {
+            if group.is_empty() {
+                continue;
+            }
+            if dim {
+                let head = Rect::from_min_size(
+                    pos2(MARGIN, top),
+                    vec2(band.width() - MARGIN - RIGHT_GUTTER, SECTION_H),
+                );
+                if head.intersects(band) {
+                    ui.painter().text(
+                        pos2(head.min.x + 2.0, head.center().y),
+                        Align2::LEFT_CENTER,
+                        "未安装",
+                        label(12.0),
+                        p.faint,
+                    );
+                    ui.painter().hline(
+                        head.min.x..=head.max.x,
+                        head.max.y - 1.0,
+                        line(p.border),
+                    );
+                }
+                top += SECTION_H;
+            }
+            for chunk in group.chunks(COLUMNS) {
+                let row_h = if first_row { 313.0 } else { 289.0 };
+                first_row = false;
+                for (col, &idx) in chunk.iter().enumerate() {
+                    let x = MARGIN + col as f32 * col_w;
+                    // The last column stops short of the scrollbar.
+                    let w = if col == COLUMNS - 1 {
+                        col_w - 2.5
+                    } else {
+                        col_w
+                    };
+                    let card = Rect::from_min_size(pos2(x, top), vec2(w, row_h));
+                    self.card(ui, card, idx, band, p);
+                    if dim {
+                        let over = pointer
+                            .map(|pos| card.contains(pos))
+                            .unwrap_or(false);
+                        if !over {
+                            let vis = card.intersect(band);
+                            if vis.is_positive() {
+                                ui.painter().rect_filled(
+                                    vis,
+                                    0,
+                                    Color32::from_rgba_unmultiplied(
+                                        p.bg.r(),
+                                        p.bg.g(),
+                                        p.bg.b(),
+                                        165,
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                top += row_h;
             }
         }
+    }
+
+    /// How tall the grid content is, for the scrollbar and the wheel.
+    fn grid_height(&self, apps: &[usize]) -> f32 {
+        let installed = apps
+            .iter()
+            .filter(|&&i| self.state.is_installed(i))
+            .count();
+        let missing = apps.len() - installed;
+        let mut h = 0.0;
+        let mut first_row = true;
+        for (count, is_missing) in [(installed, false), (missing, true)] {
+            if count == 0 {
+                continue;
+            }
+            if is_missing {
+                h += SECTION_H;
+            }
+            for _ in 0..count.div_ceil(COLUMNS) {
+                h += if first_row { 313.0 } else { 289.0 };
+                first_row = false;
+            }
+        }
+        h
     }
 
     /// One app card: a header line, the app itself, then the action button.
@@ -1700,60 +1857,368 @@ impl Launcher {
         let painter = ui.painter();
         let app = &repos()[idx];
         let installed = self.state.is_installed(idx);
-        let entries: Vec<&str> = if installed {
-            vec!["打开", "重新安装", "复制链接"]
+        let has_site = app.website.is_some();
+        // Grouped the way the reference menu is: what to do with the app,
+        // where to read about it, then the two ways to be rid of it. An
+        // empty label is a rule between groups.
+        let mut items: Vec<(&'static str, &'static str)> = Vec::new();
+        if installed {
+            items.push(("打开", "open"));
+            items.push(("重新安装", "install"));
         } else {
-            vec!["安装", "复制链接"]
-        };
-        let w = 140.0;
-        let h = entries.len() as f32 * 28.0;
-        // The menu opens below the button when there is room, and above it
-        // when there is not.
+            items.push(("安装", "install"));
+        }
+        items.push(("选择版本", "versions"));
+        items.push(("更新说明", "notes"));
+        items.push(("", "sep"));
+        if has_site {
+            items.push(("网站", "site"));
+        }
+        items.push(("GitHub 仓库", "repo"));
+        items.push(("所有版本", "all"));
+        items.push(("", "sep"));
+        if installed {
+            items.push(("卸载软件", "uninstall"));
+        }
+        items.push(("删除订阅", "unsub"));
+        items.push(("复制链接", "copy"));
+
+        let w = 168.0;
+        let row_h = 34.0;
+        let sep_h = 15.0;
+        let h: f32 = items
+            .iter()
+            .map(|(label, _)| if label.is_empty() { sep_h } else { row_h })
+            .sum();
+        // Below the button when there is room, above it when there is not.
         let below = anchor.max.y + 4.0 + h;
         let top = if below > body.max.y {
             anchor.min.y - 4.0 - h
         } else {
             anchor.max.y + 4.0
         };
-        // It opens to the left of the button when there is no room on the
-        // right, as the last column would run off the window.
         let left = if anchor.min.x + w > body.max.x - MARGIN {
             anchor.max.x - w
         } else {
             anchor.min.x
         };
         let rect = Rect::from_min_max(pos2(left, top), pos2(left + w, top + h));
+        // The pop-up closes itself once the pointer has left it — the small
+        // button that opened it still counts as being on it.
+        if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
+            if !rect.contains(pointer) && !anchor.expand(8.0).contains(pointer) {
+                self.menu_for = None;
+                return;
+            }
+        }
         painter.rect_filled(rect, 0, p.surface);
         painter.rect_stroke(rect, 0, line(p.border), StrokeKind::Middle);
 
-        for (i, entry) in entries.iter().enumerate() {
+        let mut y = rect.min.y;
+        for (i, (label, action)) in items.iter().enumerate() {
+            if label.is_empty() {
+                painter.hline(
+                    (rect.min.x + 10.0)..=(rect.max.x - 10.0),
+                    y + sep_h * 0.5,
+                    line(p.border),
+                );
+                y += sep_h;
+                continue;
+            }
             let row = Rect::from_min_max(
-                pos2(rect.min.x, rect.min.y + i as f32 * 28.0),
-                pos2(rect.max.x, rect.min.y + (i as f32 + 1.0) * 28.0),
+                pos2(rect.min.x, y),
+                pos2(rect.max.x, y + row_h),
             );
             let resp = ui.interact(
                 row,
-                ui.scope_id().with(("menu", app.id, i)),
+                egui::Id::unique(("menu", app.id, i)),
                 Sense::click(),
             );
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
             if resp.clicked() {
-                match *entry {
-                    "打开" => self.open_app(idx),
-                    "安装" | "重新安装" => self.start_job(idx),
-                    "复制链接" => self.copy_link(idx),
+                match *action {
+                    "open" => self.open_app(idx),
+                    "install" => self.start_job(idx),
+                    "versions" => self.open_versions(idx),
+                    "notes" => self.open_notes(idx),
+                    "site" => {
+                        if let Some(url) = app.website {
+                            let _ = std::process::Command::new("open").arg(url).spawn();
+                        }
+                    }
+                    "repo" => {
+                        let url = format!("https://github.com/{}", app.slug);
+                        let _ = std::process::Command::new("open").arg(url).spawn();
+                    }
+                    "all" => {
+                        let url = format!("https://github.com/{}/releases", app.slug);
+                        let _ = std::process::Command::new("open").arg(url).spawn();
+                    }
+                    "uninstall" => self.uninstall(idx),
+                    "unsub" => self.delete_subscription(idx),
+                    "copy" => self.copy_link(idx),
                     _ => {}
                 }
-                self.menu_for = None;
+                if action != &"versions" {
+                    self.menu_for = None;
+                }
+                y += row_h;
             }
             if resp.hovered() {
                 painter.rect_filled(row, 0, p.border);
             }
             painter.text(
-                pos2(row.min.x + 10.0, row.center().y),
+                pos2(row.min.x + 14.0, row.center().y),
                 Align2::LEFT_CENTER,
-                *entry,
-                text(12.5),
+                *label,
+                text(13.5),
                 p.text,
+            );
+            y += row_h;
+        }
+    }
+
+    /// Open the version chooser for one app, asking GitHub for its whole
+    /// release list on a worker thread.
+    fn open_versions(&mut self, idx: usize) {
+        self.menu_for = None;
+        self.picker = Some(Picker {
+            idx,
+            loading: true,
+            error: None,
+            list: Vec::new(),
+            chosen: 0,
+            open: false,
+        });
+        let slug = repos()[idx].slug.to_string();
+        let include_pre = self.settings.include_pre;
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let result = github::fetch_release_list(&slug, include_pre);
+            let _ = tx.send(Msg::Versions { idx, result });
+            ctx.request_repaint();
+        });
+    }
+
+    /// The notes of the newest release: its page on GitHub, where the whole
+    /// write-up lives.
+    fn open_notes(&mut self, idx: usize) {
+        let url = match self.state.release(idx) {
+            Some(rel) if !rel.html_url.is_empty() => rel.html_url.clone(),
+            _ => format!("https://github.com/{}/releases", repos()[idx].slug),
+        };
+        let _ = std::process::Command::new("open").arg(url).spawn();
+        self.state.status = format!("已在浏览器打开 {} 的更新说明", repos()[idx].name);
+    }
+
+    /// The version chooser: a panel in the middle of the window with the
+    /// release list, and a button that installs whichever one is chosen.
+    fn draw_picker(&mut self, ui: &mut Ui, full: Rect, p: &Palette) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let idx = picker.idx;
+        let name = repos()[idx].name;
+        // A scrim, so a click outside the panel does not reach the cards.
+        ui.interact(
+            full,
+            egui::Id::unique("picker-scrim"),
+            Sense::click(),
+        );
+        ui.painter()
+            .rect_filled(full, 0, Color32::from_black_alpha(140));
+
+        let w = 560.0;
+        let panel_h = 268.0;
+        let rect = Rect::from_center_size(full.center(), vec2(w, panel_h));
+        let painter = ui.painter().clone();
+        let painter = &painter;
+        painter.rect_filled(rect, radius(6), p.bg);
+        painter.rect_stroke(rect, 0, line(p.border), StrokeKind::Middle);
+
+        painter.text(
+            pos2(rect.min.x + 28.0, rect.min.y + 34.0),
+            Align2::LEFT_CENTER,
+            format!("{name} · 选择版本"),
+            display(22.0),
+            p.text,
+        );
+
+        painter.text(
+            pos2(rect.min.x + 28.0, rect.min.y + 74.0),
+            Align2::LEFT_CENTER,
+            "版本",
+            text(13.0),
+            p.muted,
+        );
+
+        // The chosen version, in a box that opens a list.
+        let field = Rect::from_min_size(
+            pos2(rect.min.x + 28.0, rect.min.y + 90.0),
+            vec2(w - 56.0, 40.0),
+        );
+        painter.rect_filled(field, 0, p.search_fill);
+        painter.rect_stroke(field, 0, line(p.border), StrokeKind::Middle);
+        let caption = match picker.list.get(picker.chosen) {
+            Some(rel) => {
+                let tag = version::clean_tag(&rel.tag).to_uppercase();
+                if picker.chosen == 0 {
+                    format!("V{tag}（最新发布）")
+                } else {
+                    format!("V{tag}")
+                }
+            }
+            None if picker.loading => "正在获取版本…".to_string(),
+            None => "没有可选版本".to_string(),
+        };
+        painter.text(
+            pos2(field.min.x + 14.0, field.center().y),
+            Align2::LEFT_CENTER,
+            &caption,
+            text(14.0),
+            p.text,
+        );
+        caret_down(
+            painter,
+            Rect::from_center_size(
+                pos2(field.max.x - 20.0, field.center().y),
+                vec2(12.0, 12.0),
+            ),
+            p.muted,
+        );
+        let resp = ui.interact(
+            field,
+            egui::Id::unique("picker-field"),
+            Sense::click(),
+        );
+        if resp.clicked() && !picker.list.is_empty() {
+            picker.open = !picker.open;
+        }
+        if picker.open {
+            let rows = picker.list.len().min(6);
+            let list_h = rows as f32 * 36.0;
+            let list = Rect::from_min_size(
+                pos2(field.min.x, field.max.y + 2.0),
+                vec2(field.width(), list_h),
+            );
+            painter.rect_filled(list, 0, p.surface);
+            painter.rect_stroke(list, 0, line(p.border), StrokeKind::Middle);
+            for (i, rel) in picker.list.iter().take(rows).enumerate() {
+                let row = Rect::from_min_size(
+                    pos2(list.min.x, list.min.y + i as f32 * 36.0),
+                    vec2(list.width(), 36.0),
+                );
+                let hovered = row.contains(
+                    ui.input(|i| i.pointer.hover_pos().unwrap_or_default()),
+                );
+                if hovered {
+                    painter.rect_filled(row, 0, p.border);
+                }
+                if i == picker.chosen {
+                    painter.rect_filled(
+                        Rect::from_min_size(row.min, vec2(3.0, row.height())),
+                        0,
+                        p.accent,
+                    );
+                }
+                let tag = version::clean_tag(&rel.tag).to_uppercase();
+                let label = if i == 0 {
+                    format!("V{tag}（最新发布）")
+                } else {
+                    format!("V{tag}")
+                };
+                painter.text(
+                    pos2(row.min.x + 14.0, row.center().y),
+                    Align2::LEFT_CENTER,
+                    label,
+                    text(13.5),
+                    if rel.asset.is_some() { p.text } else { p.faint },
+                );
+                let hit = ui.interact(
+                    row,
+                    egui::Id::unique(("picker-row", i)),
+                    Sense::click(),
+                );
+                if hit.clicked() {
+                    picker.chosen = i;
+                    picker.open = false;
+                }
+            }
+        }
+
+        // The fine print, then the two buttons.
+        let hint_y = rect.min.y + 152.0;
+        painter.text(
+            pos2(rect.min.x + 28.0, hint_y),
+            Align2::LEFT_CENTER,
+            "旧版可能无法打开你已保存的文件；安装会替换「应用程序」里的同名应用。",
+            text(12.5),
+            p.faint,
+        );
+        if let Some(err) = &picker.error {
+            painter.text(
+                pos2(rect.min.x + 28.0, hint_y + 22.0),
+                Align2::LEFT_CENTER,
+                err,
+                text(12.5),
+                p.amber,
+            );
+        }
+
+        let close = Rect::from_min_size(
+            pos2(rect.min.x + 28.0, rect.max.y - 60.0),
+            vec2(150.0, 40.0),
+        );
+        if action_button(ui, painter, close, egui::Id::unique("picker-close"), "关闭", 13.5, full, p)
+        {
+            self.picker = None;
+            return;
+        }
+        let can_install = picker
+            .list
+            .get(picker.chosen)
+            .map(|r| r.asset.is_some())
+            .unwrap_or(false);
+        let install_label = match picker.list.get(picker.chosen) {
+            Some(rel) => format!(
+                "安装版本 V{}",
+                version::clean_tag(&rel.tag).to_uppercase()
+            ),
+            None => "安装版本".to_string(),
+        };
+        let install = Rect::from_min_max(
+            pos2(rect.max.x - 28.0 - 220.0, rect.max.y - 60.0),
+            pos2(rect.max.x - 28.0, rect.max.y - 20.0),
+        );
+        if can_install {
+            if primary_button(
+                ui,
+                painter,
+                install,
+                egui::Id::unique("picker-install"),
+                &install_label,
+                13.5,
+                full,
+                p,
+            ) {
+                let rel = picker.list[picker.chosen].clone();
+                if let Some(asset) = rel.asset.clone() {
+                    self.picker = None;
+                    self.start_download(idx, asset);
+                }
+            }
+        } else {
+            let faded = Rect::from_min_size(install.min, install.size());
+            painter.rect_stroke(faded, 0, line(p.border), StrokeKind::Middle);
+            painter.text(
+                faded.center(),
+                Align2::CENTER_CENTER,
+                &install_label,
+                text(13.5),
+                p.faint,
             );
         }
     }
@@ -3351,6 +3816,7 @@ fn main() -> eframe::Result<()> {
                     Some("detail") => Demo::Detail,
                     Some("settings") => Demo::Settings,
                     Some("hover") => Demo::Hover,
+                    Some("picker") => Demo::Picker,
                     _ => Demo::None,
                 };
             }

@@ -161,8 +161,9 @@ fn pick_mac_asset(assets: &[Value]) -> Option<MacAsset> {
 /// install. Repositories that ship their Mac build under its own tag —
 /// `v2.3.0-macos` beside a Windows `v2.3.0`, say — are handled because
 /// the releases with nothing to install are simply skipped.
-pub fn fetch_latest_release(slug: &str, include_pre: bool) -> Result<ReleaseInfo, String> {
-    let url = format!("https://api.github.com/repos/{slug}/releases?per_page=15");
+/// The raw JSON of a repository's releases, newest first.
+fn releases_json(slug: &str, per_page: usize) -> Result<Vec<Value>, String> {
+    let url = format!("https://api.github.com/repos/{slug}/releases?per_page={per_page}");
     let mut req = agent()
         .get(&url)
         .set("User-Agent", UA)
@@ -186,28 +187,59 @@ pub fn fetch_latest_release(slug: &str, include_pre: bool) -> Result<ReleaseInfo
     if arr.is_empty() {
         return Err("该仓库还没有发布任何版本".to_string());
     }
-    for rel in arr {
-        if rel["draft"].as_bool().unwrap_or(true) {
-            continue;
+    Ok(arr.clone())
+}
+
+/// One release, read out of the API's JSON. `None` for drafts, and for
+/// prereleases when they are not wanted.
+fn release_from_json(rel: &Value, include_pre: bool) -> Option<ReleaseInfo> {
+    if rel["draft"].as_bool().unwrap_or(true) {
+        return None;
+    }
+    if rel["prerelease"].as_bool().unwrap_or(false) && !include_pre {
+        return None;
+    }
+    let tag = rel["tag_name"].as_str()?;
+    if tag.is_empty() {
+        return None;
+    }
+    let asset = rel["assets"]
+        .as_array()
+        .and_then(|assets| pick_mac_asset(assets));
+    Some(ReleaseInfo {
+        tag: tag.to_string(),
+        published: rel["published_at"].as_str().unwrap_or("").to_string(),
+        html_url: rel["html_url"].as_str().unwrap_or_default().to_string(),
+        body: rel["body"].as_str().unwrap_or("").to_string(),
+        asset,
+    })
+}
+
+pub fn fetch_latest_release(slug: &str, include_pre: bool) -> Result<ReleaseInfo, String> {
+    let arr = releases_json(slug, 15)?;
+    for rel in &arr {
+        if let Some(info) = release_from_json(rel, include_pre) {
+            if info.asset.is_some() {
+                return Ok(info);
+            }
         }
-        if rel["prerelease"].as_bool().unwrap_or(false) && !include_pre {
-            continue;
-        }
-        let Some(tag) = rel["tag_name"].as_str() else { continue };
-        if tag.is_empty() {
-            continue;
-        }
-        let Some(assets) = rel["assets"].as_array() else { continue };
-        let Some(asset) = pick_mac_asset(assets) else { continue };
-        return Ok(ReleaseInfo {
-            tag: tag.to_string(),
-            published: rel["published_at"].as_str().unwrap_or("").to_string(),
-            html_url: rel["html_url"].as_str().unwrap_or_default().to_string(),
-            body: rel["body"].as_str().unwrap_or("").to_string(),
-            asset: Some(asset),
-        });
     }
     Err("最新的发布里没有 macOS 安装包".to_string())
+}
+
+/// Every published release, newest first, for the version picker. Releases
+/// without a Mac asset are kept, with `asset` empty, so the list still
+/// reads as a history.
+pub fn fetch_release_list(slug: &str, include_pre: bool) -> Result<Vec<ReleaseInfo>, String> {
+    let arr = releases_json(slug, 30)?;
+    let list: Vec<ReleaseInfo> = arr
+        .iter()
+        .filter_map(|rel| release_from_json(rel, include_pre))
+        .collect();
+    if list.is_empty() {
+        return Err("该仓库还没有发布任何版本".to_string());
+    }
+    Ok(list)
 }
 
 /// The release notes as a list of changes for the detail page. Bullet

@@ -81,6 +81,11 @@ pub enum Msg {
         /// it stopped ("cancelled" when the person clicked it away).
         result: Result<String, String>,
     },
+    /// The whole release list for the version chooser.
+    Versions {
+        idx: usize,
+        result: Result<Vec<crate::github::ReleaseInfo>, String>,
+    },
     /// The repository's own description, fetched once and kept on disk.
     /// An empty string records "asked, and it has none".
     Description { slug: String, text: String },
