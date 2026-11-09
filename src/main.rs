@@ -152,8 +152,6 @@ struct Launcher {
     /// A card to draw as though the pointer were over it. Only set by the
     /// hover demo, so the accent frame can be checked in a picture.
     hover_demo: Option<usize>,
-    /// Why the last attempt to add a repository was refused, if it was.
-    settings_error: Option<String>,
     /// Set after a repository is added, so the grid scrolls to the end and
     /// the new card is actually on screen.
     pending_scroll_end: bool,
@@ -207,7 +205,6 @@ impl Launcher {
             descriptions: load_descriptions(),
             releases: load_releases(),
             hover_demo: None,
-            settings_error: None,
             pending_scroll_end: false,
             picker: None,
             batch: None,
@@ -351,35 +348,7 @@ impl Launcher {
     }
 
 
-    /// Ask GitHub about one repository only, on its own thread.
-    fn spawn_meta_one(&mut self, idx: usize) {
-        let list = repos();
-        if idx >= list.len() {
-            return;
-        }
-        let tx = self.tx.clone();
-        let ctx = self.ctx.clone();
-        let slug = list[idx].slug.to_string();
-        let include_pre = self.settings.include_pre;
-        let cached = self.descriptions.contains_key(&slug);
-        std::thread::spawn(move || {
-            let result = github::fetch_latest_release(&slug, include_pre);
-            let _ = tx.send(Msg::Meta { idx, result });
-            if !cached {
-                if let Some(text) = github::fetch_repo_description(&slug) {
-                    let _ = tx.send(Msg::Description { slug, text });
-                }
-            }
-            ctx.request_repaint();
-        });
-    }
 
-    /// Keep the per-row side tables the same length as the live list.
-    fn sync_arrays(&mut self) {
-        let n = repos().len();
-        self.icons.resize(n, None);
-        self.icon_uv.resize(n, (0.0, 0.0, 1.0, 1.0));
-    }
 
     /// Rebuild every per-row table after the live list has changed shape.
     /// Any running download is cancelled first, so no late message lands
@@ -409,35 +378,6 @@ impl Launcher {
     /// by the same rules as everything else: its newest release is read
     /// straight away, its installed copy is looked for, and its icon is
     /// loaded if the app is already here.
-    fn add_repository(&mut self, input: &str) {
-        match catalog::add_custom(input) {
-            Ok(idx) => {
-                self.settings_error = None;
-                let slug = repos()[idx].slug.to_string();
-                self.settings.custom.push(slug.clone());
-                self.settings.disabled.retain(|d| d != &slug);
-                state::save_settings(&self.settings);
-                self.sync_arrays();
-                let installed = install::installed_version(repos()[idx].bundle);
-                self.state.repos.push(state::RepoState {
-                    fetch: FetchState::Pending,
-                    installed,
-                    job: None,
-                });
-                self.state.subscribed.push(true);
-                self.state.status =
-                    format!("已添加订阅 {}（新卡片在列表末尾）", repos()[idx].name);
-                self.pending_scroll_end = true;
-                self.settings_input.clear();
-                self.spawn_meta_one(idx);
-                self.spawn_icon_load();
-            }
-            Err(e) => {
-                self.state.status = e.clone();
-                self.settings_error = Some(e);
-            }
-        }
-    }
 
     /// Move the installed app to the Bin. The subscription stays, so the
     /// card turns back into 安装 and the app can be put back with one click.
@@ -748,11 +688,6 @@ impl Launcher {
     }
 
     /// Copy the repository's address.
-    fn copy_link(&mut self, idx: usize) {
-        let url = format!("https://github.com/{}", repos()[idx].slug);
-        self.ctx.copy_text(url);
-        self.state.status = "已复制仓库链接".to_string();
-    }
 
     /// What the big button on a card does.
     fn act(&mut self, idx: usize) {
@@ -1038,6 +973,43 @@ impl Launcher {
                     p.muted,
                 );
                 self.draw_detail_nav(ui, rect, mid, idx, p);
+            }
+        }
+
+        // On the home screen, a box for adding a subscription sits just
+        // left of the cog. Clicking it opens the importer.
+        if self.page == Page::Grid {
+            let box_w = 200.0;
+            let add_box = Rect::from_min_max(
+                pos2(rect.max.x - 48.0 - 10.0 - box_w, mid - 13.0),
+                pos2(rect.max.x - 48.0 - 10.0, mid + 13.0),
+            );
+            let over = add_box
+                .contains(ui.input(|i| i.pointer.hover_pos()).unwrap_or_default());
+            ui.painter().rect_filled(add_box, 0, p.search_fill);
+            ui.painter().rect_stroke(
+                add_box,
+                0,
+                if over {
+                    Stroke::new(1.5, p.accent)
+                } else {
+                    line(p.border)
+                },
+                StrokeKind::Middle,
+            );
+            ui.painter().text(
+                pos2(add_box.min.x + 12.0, add_box.center().y),
+                Align2::LEFT_CENTER,
+                "添加订阅",
+                text(13.0),
+                if over { p.accent } else { p.faint },
+            );
+            let resp = ui.interact(add_box, egui::Id::unique("topbar-add"), Sense::click());
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                self.open_batch();
             }
         }
 
@@ -1897,31 +1869,21 @@ impl Launcher {
         let painter = ui.painter();
         let app = &repos()[idx];
         let installed = self.state.is_installed(idx);
-        let has_site = app.website.is_some();
         // Grouped the way the reference menu is: what to do with the app,
         // where to read about it, then the two ways to be rid of it. An
         // empty label is a rule between groups.
+        // The menu the picture asks for: where to read about the app, in
+        // the order it was given, then the two ways to be rid of it.
         let mut items: Vec<(&'static str, &'static str)> = Vec::new();
-        if installed {
-            items.push(("打开", "open"));
-            items.push(("重新安装", "install"));
-        } else {
-            items.push(("安装", "install"));
-        }
-        items.push(("选择版本", "versions"));
-        items.push(("更新说明", "notes"));
-        items.push(("", "sep"));
-        if has_site {
-            items.push(("网站", "site"));
-        }
         items.push(("GitHub 仓库", "repo"));
+        items.push(("更新说明", "notes"));
         items.push(("所有版本", "all"));
+        items.push(("选择版本", "versions"));
         items.push(("", "sep"));
         if installed {
             items.push(("卸载软件", "uninstall"));
         }
         items.push(("删除订阅", "unsub"));
-        items.push(("复制链接", "copy"));
 
         let w = 168.0;
         let row_h = 34.0;
@@ -1979,15 +1941,8 @@ impl Launcher {
             }
             if resp.clicked() {
                 match *action {
-                    "open" => self.open_app(idx),
-                    "install" => self.start_job(idx),
                     "versions" => self.open_versions(idx),
                     "notes" => self.open_notes(idx),
-                    "site" => {
-                        if let Some(url) = app.website {
-                            let _ = std::process::Command::new("open").arg(url).spawn();
-                        }
-                    }
                     "repo" => {
                         let url = format!("https://github.com/{}", app.slug);
                         let _ = std::process::Command::new("open").arg(url).spawn();
@@ -1998,7 +1953,6 @@ impl Launcher {
                     }
                     "uninstall" => self.uninstall(idx),
                     "unsub" => self.delete_subscription(idx),
-                    "copy" => self.copy_link(idx),
                     _ => {}
                 }
                 if action != &"versions" {
@@ -2132,7 +2086,7 @@ impl Launcher {
         painter.text(
             pos2(rect.min.x + 28.0, rect.min.y + 34.0),
             Align2::LEFT_CENTER,
-            "批量导入仓库",
+            "添加订阅",
             display(22.0),
             p.text,
         );
@@ -2229,7 +2183,7 @@ impl Launcher {
             painter,
             import,
             egui::Id::unique("batch-import"),
-            "导入",
+            "添加",
             13.0,
             full,
             p,
@@ -2814,152 +2768,7 @@ impl Launcher {
                 self.spawn_meta_fetch_all();
                 self.state.status = "已恢复全部内置仓库".to_string();
             }
-            ry += 28.0;
         }
-        ry += 12.0;
-
-        // The add box: a link or a slug goes in, the same rules take over
-        // from there. The field has a fixed id so it keeps its focus (and
-        // therefore keeps working) across frames, a click anywhere on the
-        // box puts the caret in it, and a 粘贴 button reads the clipboard
-        // itself so adding never depends on a keyboard shortcut working.
-        let add_w = col_w - 178.0;
-        let add_box = Rect::from_min_size(pos2(right_x, ry), vec2(add_w, 32.0));
-        painter.rect_filled(add_box, 0, p.search_fill);
-        let field_id = egui::Id::unique("settings-add-field");
-        let field_focused = ui.memory(|m| m.has_focus(field_id));
-        painter.rect_stroke(
-            add_box,
-            0,
-            if field_focused {
-                Stroke::new(1.0, p.accent)
-            } else {
-                line(p.border)
-            },
-            StrokeKind::Middle,
-        );
-        if self.settings_input.is_empty() {
-            painter.text(
-                pos2(add_box.min.x + 10.0, add_box.center().y),
-                Align2::LEFT_CENTER,
-                "粘贴链接或 owner/repo；多个用「批量导入…」",
-                text(12.0),
-                p.faint,
-            );
-        }
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(Rect::from_min_max(
-                    pos2(add_box.min.x + 8.0, add_box.min.y + 1.0),
-                    pos2(add_box.max.x - 8.0, add_box.max.y - 1.0),
-                ))
-                .id_salt("settings-add-field-ui"),
-        );
-        let field_resp = child.add_sized(
-            vec2(add_box.width() - 16.0, 28.0),
-            TextEdit::singleline(&mut self.settings_input)
-                .id(field_id)
-                .text_color(p.text)
-                .frame(egui::Frame::NONE)
-                .desired_width(add_box.width() - 16.0),
-        );
-        if ui.rect_contains_pointer(add_box)
-            && ui.input(|i| i.pointer.primary_pressed())
-        {
-            ui.memory_mut(|m| m.request_focus(field_id));
-        }
-        // Command-V, handled here when the window manager has not already
-        // turned it into a paste: the field is the one on screen, and the
-        // clipboard is read directly.
-        if field_focused
-            && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V))
-        {
-            let already = ui.input(|i| {
-                i.events
-                    .iter()
-                    .any(|e| matches!(e, egui::Event::Paste(_)))
-            });
-            if !already {
-                if let Some(text) = clipboard_text() {
-                    self.settings_input.push_str(&text);
-                }
-            }
-        }
-
-        let batch_btn = Rect::from_min_size(
-            pos2(add_box.max.x + 8.0, ry),
-            vec2(100.0, 32.0),
-        );
-        let add_btn = Rect::from_min_size(
-            pos2(batch_btn.max.x + 8.0, ry),
-            vec2(64.0, 32.0),
-        );
-        let mut submit = field_resp.lost_focus()
-            && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        for (rect, caption, id, opens_batch) in [
-            (batch_btn, "批量导入…", "settings-batch", true),
-            (add_btn, "添加", "settings-add", false),
-        ] {
-            let hit = rect.intersect(band);
-            let mut hovered = false;
-            let mut clicked = false;
-            if hit.is_positive() {
-                let resp = ui.interact(hit, egui::Id::unique(id), Sense::click());
-                hovered = resp.hovered();
-                clicked = resp.clicked();
-            }
-            if hovered {
-                painter.rect_filled(rect, 0, p.surface);
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            painter.rect_stroke(
-                rect,
-                0,
-                if hovered {
-                    Stroke::new(1.5, p.accent)
-                } else {
-                    line(p.border)
-                },
-                StrokeKind::Middle,
-            );
-            painter.text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                caption,
-                text(13.0),
-                if hovered { p.accent } else { p.text },
-            );
-            if clicked {
-                if opens_batch {
-                    self.open_batch();
-                } else {
-                    submit = true;
-                }
-            }
-        }
-        if submit {
-            let typed = self.settings_input.clone();
-            self.add_repository(&typed);
-        }
-        // Whatever went wrong with the last attempt, said plainly under the
-        // box, so a rejected address never looks like a dead button.
-        if let Some(err) = &self.settings_error {
-            painter.text(
-                pos2(right_x, ry + 46.0),
-                Align2::LEFT_CENTER,
-                err,
-                text(12.0),
-                p.amber,
-            );
-        }
-        ry += 44.0;        ry += 44.0;
-        painter.text(
-            pos2(right_x, ry),
-            Align2::LEFT_CENTER,
-            "支持完整的 GitHub 链接；添加后自动拉取发布、查找本机版本并加载图标。",
-            text(11.5),
-            p.faint,
-        );
 
         // --------------------------------------------- the bottom buttons
         let by = band.max.y - 44.0;
