@@ -124,6 +124,9 @@ struct Launcher {
     hover_demo: Option<usize>,
     /// Why the last attempt to add a repository was refused, if it was.
     settings_error: Option<String>,
+    /// Set after a repository is added, so the grid scrolls to the end and
+    /// the new card is actually on screen.
+    pending_scroll_end: bool,
 }
 
 impl Launcher {
@@ -171,6 +174,7 @@ impl Launcher {
             releases: load_releases(),
             hover_demo: None,
             settings_error: None,
+            pending_scroll_end: false,
         };
         for (i, repo) in repos().iter().enumerate() {
             launcher.state.subscribed[i] = !launcher.settings.disabled.iter().any(|d| d == repo.id);
@@ -376,7 +380,9 @@ impl Launcher {
                     job: None,
                 });
                 self.state.subscribed.push(true);
-                self.state.status = format!("已添加订阅 {}", slug);
+                self.state.status =
+                    format!("已添加订阅 {}（新卡片在列表末尾）", repos()[idx].name);
+                self.pending_scroll_end = true;
                 self.settings_input.clear();
                 self.spawn_meta_one(idx);
                 self.spawn_icon_load();
@@ -681,54 +687,53 @@ struct App {
 }
 
 impl eframe::App for App {
-    /// Command-V in the add-repository field. The window manager normally
-    /// turns that into a paste event, which the field handles itself; when
-    /// it does not, the clipboard is read here and put in the field, so
-    /// pasting never depends on that path working.
+    /// Command-V while the settings page is open. The field is the only
+    /// text in the window, so the paste goes there whatever happens to have
+    /// the keyboard, and the field is given the focus afterwards. The
+    /// window manager's own paste event, when it arrives, is consumed here
+    /// so nothing is pasted twice.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         if self.launcher.page != Page::Settings {
             return;
         }
-        let field = egui::Id::unique("settings-add-field");
-        if !ctx.memory(|m| m.has_focus(field)) {
-            return;
-        }
-        if raw_input
-            .events
-            .iter()
-            .any(|e| matches!(e, egui::Event::Paste(_)))
-        {
-            return;
-        }
-        let cmd_v = raw_input.events.iter().any(|e| {
-            matches!(
-                e,
+        let mut pasted: Option<String> = None;
+        let mut cmd_v = false;
+        for event in &raw_input.events {
+            match event {
+                egui::Event::Paste(text) => pasted = Some(text.clone()),
                 egui::Event::Key {
                     key: egui::Key::V,
                     pressed: true,
                     modifiers,
                     ..
-                } if modifiers.command
-            )
-        });
-        if !cmd_v {
+                } if modifiers.command => cmd_v = true,
+                _ => {}
+            }
+        }
+        let text = match pasted {
+            Some(text) => Some(text),
+            None if cmd_v => clipboard_text(),
+            None => None,
+        };
+        let Some(text) = text else {
             return;
-        }
-        if let Some(text) = clipboard_text() {
-            self.launcher.settings_input.push_str(&text);
-        }
-        raw_input.events.retain(|e| {
-            !matches!(
-                e,
-                egui::Event::Key {
-                    key: egui::Key::V,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } if modifiers.command
-            )
+        };
+        self.launcher.settings_input = text.trim().to_string();
+        ctx.memory_mut(|m| m.request_focus(egui::Id::unique("settings-add-field")));
+        raw_input.events.retain(|event| {
+            !matches!(event, egui::Event::Paste(_))
+                && !matches!(
+                    event,
+                    egui::Event::Key {
+                        key: egui::Key::V,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } if modifiers.command
+                )
         });
     }
+
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // The window's own backdrop, matching the page colour.
@@ -1231,6 +1236,13 @@ impl Launcher {
             }
             View::List => 44.0 + apps.len() as f32 * 70.0,
         };
+
+        // A repository that has just been added sits at the end of the
+        // list, so the grid goes there to show it.
+        if self.pending_scroll_end {
+            self.state.scroll = (content_h - band.height()).max(0.0);
+            self.pending_scroll_end = false;
+        }
 
         // The wheel moves the grid, in the same direction the Mac's own
         // scrollbars move.
@@ -3450,7 +3462,14 @@ impl eframe::App for ScreenshotApp {
     /// parks the pointer somewhere, and GITUP_UI_TEST types into the
     /// add-repository field and then presses 添加, so the whole flow can be
     /// checked from a picture.
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if std::env::var("GITUP_PASTE_TEST").is_ok() && self.pass == 10 {
+            raw_input.events.push(egui::Event::Paste(
+                "https://github.com/diamondfsd/luna-ai-cut".to_string(),
+            ));
+        }
+        // The real app's hook still runs, so a test exercises the real path.
+        self.inner.raw_input_hook(ctx, raw_input);
         self.pass += 1;
         let click = |pass: u32, pos: egui::Pos2, raw_input: &mut egui::RawInput| {
             if self.pass == pass {
