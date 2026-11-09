@@ -124,6 +124,8 @@ struct Launcher {
     /// A card to draw as though the pointer were over it. Only set by the
     /// hover demo, so the accent frame can be checked in a picture.
     hover_demo: Option<usize>,
+    /// Why the last attempt to add a repository was refused, if it was.
+    settings_error: Option<String>,
 }
 
 impl Launcher {
@@ -170,6 +172,7 @@ impl Launcher {
             descriptions: load_descriptions(),
             releases: load_releases(),
             hover_demo: None,
+            settings_error: None,
         };
         for (i, repo) in repos().iter().enumerate() {
             launcher.state.subscribed[i] = !launcher.settings.disabled.iter().any(|d| d == repo.id);
@@ -360,6 +363,7 @@ impl Launcher {
     fn add_repository(&mut self, input: &str) {
         match catalog::add_custom(input) {
             Ok(idx) => {
+                self.settings_error = None;
                 let slug = repos()[idx].slug.to_string();
                 self.settings.custom.push(slug.clone());
                 state::save_settings(&self.settings);
@@ -376,7 +380,10 @@ impl Launcher {
                 self.spawn_meta_one(idx);
                 self.spawn_icon_load();
             }
-            Err(e) => self.state.status = e,
+            Err(e) => {
+                self.state.status = e.clone();
+                self.settings_error = Some(e);
+            }
         }
     }
 
@@ -1512,24 +1519,17 @@ impl Launcher {
                 pos2(left_edge, btn_y),
                 pos2(left_edge + 88.0, btn_y + btn_h),
             );
-            painter.rect_stroke(launch, 0, line(p.border), StrokeKind::Middle);
-            painter.text(
-                pos2(launch.center().x, launch.center().y),
-                Align2::CENTER_CENTER,
+            if action_button(
+                ui,
+                painter,
+                launch,
+                egui::Id::unique(("launch", app.id)),
                 "打开",
-                text(15.0),
-                p.text,
-            );
-            let hit = launch.intersect(band);
-            if hit.is_positive() {
-                let resp = ui.interact(
-                    hit,
-                    ui.scope_id().with(("launch", app.id)),
-                    Sense::click(),
-                );
-                if resp.clicked() {
-                    self.open_app(idx);
-                }
+                15.0,
+                band,
+                p,
+            ) {
+                self.open_app(idx);
             }
             main_left = launch.max.x + 8.0;
         }
@@ -1538,15 +1538,19 @@ impl Launcher {
             pos2(main_rect.max.x, btn_y + btn_h),
         );
 
-        let label_text = self.button_label(idx);
-        painter.rect_stroke(open_rect, 0, line(p.border), StrokeKind::Middle);
-        painter.text(
-            pos2(open_rect.center().x, open_rect.center().y),
-            Align2::CENTER_CENTER,
-            label_text,
-            text(15.0),
-            p.text,
-        );
+        let label_text = self.button_label(idx).to_string();
+        if action_button(
+            ui,
+            painter,
+            open_rect,
+            egui::Id::unique(("open", app.id)),
+            &label_text,
+            15.0,
+            band,
+            p,
+        ) {
+            self.act(idx);
+        }
         if busy && phase == JobPhase::Downloading && progress > 0.0 {
             // Fill the button in step with the real download.
             let filled = Rect::from_min_max(
@@ -1567,41 +1571,22 @@ impl Launcher {
             );
         }
 
-        let open_hit = open_rect.intersect(band);
-        if open_hit.is_positive() {
-            let resp_open = ui.interact(
-                open_hit,
-                ui.scope_id().with(("open", app.id)),
-                Sense::click(),
-            );
-            if resp_open.clicked() {
-                self.act(idx);
-            }
-        }
-
-        painter.rect_stroke(more_rect, 0, line(p.border), StrokeKind::Middle);
-        painter.text(
-            pos2(more_rect.center().x, more_rect.center().y),
-            Align2::CENTER_CENTER,
+        if action_button(
+            ui,
+            painter,
+            more_rect,
+            egui::Id::unique(("more", app.id)),
             "…",
-            text(13.0),
-            p.muted,
-        );
-        let more_hit = more_rect.intersect(band);
-        if more_hit.is_positive() {
-            let resp_more = ui.interact(
-                more_hit,
-                ui.scope_id().with(("more", app.id)),
-                Sense::click(),
-            );
-            if resp_more.clicked() {
-                self.menu_for = if self.menu_for == Some(idx) {
-                    None
-                } else {
-                    Some(idx)
-                };
-                self.sort_open = false;
-            }
+            13.0,
+            band,
+            p,
+        ) {
+            self.menu_for = if self.menu_for == Some(idx) {
+                None
+            } else {
+                Some(idx)
+            };
+            self.sort_open = false;
         }
 
         // The little menu that opens beside the button is drawn last, on
@@ -1971,9 +1956,10 @@ impl Launcher {
                 );
             }
             let custom = !catalog::is_builtin(repo.slug);
-            // A repository the person added gets a little outlined cross at
-            // the end of its row that removes it altogether. It is drawn as
-            // a proper button, so it reads as one.
+            // Every subscribed row carries a cross at the end of its name:
+            // on a repository the person added it deletes the entry, on a
+            // built-in one it unsubscribes, which is the same thing from
+            // the window's point of view.
             painter.text(
                 pos2(box_r.max.x + 8.0, box_r.center().y),
                 Align2::LEFT_CENTER,
@@ -1981,16 +1967,16 @@ impl Launcher {
                 text(13.0),
                 if checked { p.text } else { p.faint },
             );
-            if custom {
+            if custom || checked {
                 let name_w = measure(ui, repo.name, text(13.0));
                 let cx_x = (box_r.max.x + 8.0 + name_w + 8.0)
                     .min(x + sub_cell_w - 22.0);
                 let cx = Rect::from_min_size(pos2(cx_x, yy - 10.0), vec2(20.0, 20.0));
-                let hovered = cx.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()));
+                let over = cx.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()));
                 painter.rect_stroke(
                     cx,
                     radius(4),
-                    if hovered {
+                    if over {
                         Stroke::new(1.0, p.amber)
                     } else {
                         line(p.border)
@@ -1998,7 +1984,7 @@ impl Launcher {
                     StrokeKind::Middle,
                 );
                 let c = cx.center();
-                let st = Stroke::new(1.4, if hovered { p.amber } else { p.muted });
+                let st = Stroke::new(1.4, if over { p.amber } else { p.muted });
                 painter.line_segment(
                     [egui::pos2(c.x - 4.0, c.y - 4.0), egui::pos2(c.x + 4.0, c.y + 4.0)],
                     st,
@@ -2011,17 +1997,21 @@ impl Launcher {
                 if hit.is_positive() {
                     let resp = ui.interact(
                         hit,
-                        ui.scope_id().with(("settings-remove", repo.slug)),
+                        egui::Id::unique(("settings-remove", repo.slug)),
                         Sense::click(),
                     );
                     if resp.clicked() {
-                        self.remove_repository(i);
+                        if custom {
+                            self.remove_repository(i);
+                        } else {
+                            self.toggle_subscription(i);
+                        }
                     }
                 }
             }
             let hit = Rect::from_min_size(
                 pos2(x, yy - 13.0),
-                vec2(sub_cell_w - if custom { 22.0 } else { 0.0 }, 26.0),
+                vec2(sub_cell_w - 24.0, 26.0),
             );
             if hit.intersect(band).is_positive() {
                 let resp = ui.interact(
@@ -2039,9 +2029,10 @@ impl Launcher {
 
         // The add box: a link or a slug goes in, the same rules take over
         // from there. The field has a fixed id so it keeps its focus (and
-        // therefore keeps working for typing and pasting) across frames,
-        // and a click anywhere on the box puts the caret in it.
-        let add_w = col_w - 72.0;
+        // therefore keeps working) across frames, a click anywhere on the
+        // box puts the caret in it, and a 粘贴 button reads the clipboard
+        // itself so adding never depends on a keyboard shortcut working.
+        let add_w = col_w - 132.0;
         let add_box = Rect::from_min_size(pos2(right_x, ry), vec2(add_w, 32.0));
         painter.rect_filled(add_box, 0, p.search_fill);
         let field_id = egui::Id::unique("settings-add-field");
@@ -2073,7 +2064,7 @@ impl Launcher {
                 ))
                 .id_salt("settings-add-field-ui"),
         );
-        child.add_sized(
+        let field_resp = child.add_sized(
             vec2(add_box.width() - 16.0, 28.0),
             TextEdit::singleline(&mut self.settings_input)
                 .id(field_id)
@@ -2086,33 +2077,96 @@ impl Launcher {
         {
             ui.memory_mut(|m| m.request_focus(field_id));
         }
-        let add_btn = Rect::from_min_size(
-            pos2(add_box.max.x + 8.0, ry),
-            vec2(64.0, 32.0),
-        );
-        painter.rect_stroke(add_btn, 0, line(p.border), StrokeKind::Middle);
-        painter.text(
-            pos2(add_btn.center().x, add_btn.center().y),
-            Align2::CENTER_CENTER,
-            "添加",
-            text(13.0),
-            p.text,
-        );
-        let hit = add_btn.intersect(band);
-        if hit.is_positive() {
-            let resp = ui.interact(hit, ui.scope_id().with("settings-add"), Sense::click());
-            if resp.clicked() {
-                let typed = self.settings_input.clone();
-                self.add_repository(&typed);
+        // Command-V, handled here when the window manager has not already
+        // turned it into a paste: the field is the one on screen, and the
+        // clipboard is read directly.
+        if field_focused
+            && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V))
+        {
+            let already = ui.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Paste(_)))
+            });
+            if !already {
+                if let Some(text) = clipboard_text() {
+                    self.settings_input.push_str(&text);
+                }
             }
         }
-        // Enter in the box does the same as the button.
-        if self.settings_input.ends_with('\n') {
-            self.settings_input = self.settings_input.trim_end().to_string();
+
+        let paste_btn = Rect::from_min_size(
+            pos2(add_box.max.x + 8.0, ry),
+            vec2(58.0, 32.0),
+        );
+        let add_btn = Rect::from_min_size(
+            pos2(paste_btn.max.x + 8.0, ry),
+            vec2(58.0, 32.0),
+        );
+        let mut submit = field_resp.lost_focus()
+            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        for (rect, caption, id, paste) in [
+            (paste_btn, "粘贴", "settings-paste", true),
+            (add_btn, "添加", "settings-add", false),
+        ] {
+            let hit = rect.intersect(band);
+            let mut hovered = false;
+            let mut clicked = false;
+            if hit.is_positive() {
+                let resp = ui.interact(hit, egui::Id::unique(id), Sense::click());
+                hovered = resp.hovered();
+                clicked = resp.clicked();
+            }
+            if hovered {
+                painter.rect_filled(rect, 0, p.surface);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            painter.rect_stroke(
+                rect,
+                0,
+                if hovered {
+                    Stroke::new(1.5, p.accent)
+                } else {
+                    line(p.border)
+                },
+                StrokeKind::Middle,
+            );
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                caption,
+                text(13.0),
+                if hovered { p.accent } else { p.text },
+            );
+            if clicked {
+                if paste {
+                    if let Some(text) = clipboard_text() {
+                        self.settings_input = text;
+                        ui.memory_mut(|m| m.request_focus(field_id));
+                    } else {
+                        self.settings_error = Some("剪贴板里没有文字".to_string());
+                    }
+                } else {
+                    submit = true;
+                }
+            }
+        }
+        if submit {
             let typed = self.settings_input.clone();
             self.add_repository(&typed);
         }
-        ry += 44.0;
+        // Whatever went wrong with the last attempt, said plainly under the
+        // box, so a rejected address never looks like a dead button.
+        if let Some(err) = &self.settings_error {
+            painter.text(
+                pos2(right_x, ry + 46.0),
+                Align2::LEFT_CENTER,
+                err,
+                text(12.0),
+                p.amber,
+            );
+        }
+        ry += 44.0;        ry += 44.0;
         painter.text(
             pos2(right_x, ry),
             Align2::LEFT_CENTER,
@@ -2317,16 +2371,20 @@ impl Launcher {
                 .as_ref()
                 .map(|j| (j.phase, j.progress))
                 .unwrap_or((JobPhase::Downloading, 0.0));
-            let label_text = self.button_label(idx);
+            let label_text = self.button_label(idx).to_string();
             let btn = Rect::from_min_size(pos2(act_x, row.center().y - 13.0), vec2(86.0, 26.0));
-            clip.rect_stroke(btn, 0, line(p.border), StrokeKind::Middle);
-            clip.text(
-                pos2(btn.center().x, btn.center().y),
-                Align2::CENTER_CENTER,
-                label_text,
-                text(12.5),
-                p.text,
-            );
+            if action_button(
+                ui,
+                &clip,
+                btn,
+                egui::Id::unique(("row", app.id)),
+                &label_text,
+                12.5,
+                band,
+                p,
+            ) {
+                self.act(idx);
+            }
             if busy && phase == JobPhase::Downloading && progress > 0.0 {
                 let filled = Rect::from_min_max(
                     btn.min,
@@ -2337,44 +2395,30 @@ impl Launcher {
                 clip.text(
                     pos2(btn.center().x, btn.center().y),
                     Align2::CENTER_CENTER,
-                    label_text,
+                    &label_text,
                     text(12.5),
                     p.text,
                 );
             }
-            let btn_hit = btn.intersect(band);
-            if btn_hit.is_positive() {
-                let resp = ui.interact(btn_hit, ui.scope_id().with(("row", app.id)), Sense::click());
-                if resp.clicked() {
-                    self.act(idx);
-                }
-            }
 
             // The little menu at the far right.
             let more = Rect::from_min_size(pos2(more_x, row.center().y - 13.0), vec2(37.0, 26.0));
-            clip.rect_stroke(more, 0, line(p.border), StrokeKind::Middle);
-            clip.text(
-                pos2(more.center().x, more.center().y),
-                Align2::CENTER_CENTER,
+            if action_button(
+                ui,
+                &clip,
+                more,
+                egui::Id::unique(("rowmore", app.id)),
                 "…",
-                text(13.0),
-                p.muted,
-            );
-            let more_hit = more.intersect(band);
-            if more_hit.is_positive() {
-                let resp = ui.interact(
-                    more_hit,
-                    ui.scope_id().with(("rowmore", app.id)),
-                    Sense::click(),
-                );
-                if resp.clicked() {
-                    self.menu_for = if self.menu_for == Some(idx) {
-                        None
-                    } else {
-                        Some(idx)
-                    };
-                    self.sort_open = false;
-                }
+                13.0,
+                band,
+                p,
+            ) {
+                self.menu_for = if self.menu_for == Some(idx) {
+                    None
+                } else {
+                    Some(idx)
+                };
+                self.sort_open = false;
             }
             if self.menu_for == Some(idx) {
                 self.pending_menu = Some((more, idx));
@@ -2505,15 +2549,19 @@ impl Launcher {
             pos2(more_rect.min.x - 8.0, at(66.0)),
         );
         if draw {
-            let label_text = self.button_label(idx);
-            painter.rect_stroke(main_rect, 0, line(p.border), StrokeKind::Middle);
-            painter.text(
-                pos2(main_rect.center().x, main_rect.center().y),
-                Align2::CENTER_CENTER,
-                label_text,
-                text(15.0),
-                p.text,
-            );
+            let label_text = self.button_label(idx).to_string();
+            if action_button(
+                ui,
+                &painter,
+                main_rect,
+                egui::Id::unique(("dopen", app.id)),
+                &label_text,
+                15.0,
+                band,
+                p,
+            ) {
+                self.act(idx);
+            }
             if busy && phase == JobPhase::Downloading && progress > 0.0 {
                 let filled = Rect::from_min_max(
                     main_rect.min,
@@ -2529,33 +2577,22 @@ impl Launcher {
                     p.text,
                 );
             }
-            painter.rect_stroke(more_rect, 0, line(p.border), StrokeKind::Middle);
-            let hit = main_rect.intersect(band);
-            if hit.is_positive() {
-                let resp = ui.interact(
-                    hit,
-                    ui.scope_id().with(("dopen", app.id)),
-                    Sense::click(),
-                );
-                if resp.clicked() {
-                    self.act(idx);
-                }
-            }
-            let hit = more_rect.intersect(band);
-            if hit.is_positive() {
-                let resp = ui.interact(
-                    hit,
-                    ui.scope_id().with(("dmore", app.id)),
-                    Sense::click(),
-                );
-                if resp.clicked() {
-                    self.menu_for = if self.menu_for == Some(idx) {
-                        None
-                    } else {
-                        Some(idx)
-                    };
-                    self.sort_open = false;
-                }
+            if action_button(
+                ui,
+                &painter,
+                more_rect,
+                egui::Id::unique(("dmore", app.id)),
+                "…",
+                13.0,
+                band,
+                p,
+            ) {
+                self.menu_for = if self.menu_for == Some(idx) {
+                    None
+                } else {
+                    Some(idx)
+                };
+                self.sort_open = false;
             }
             if self.menu_for == Some(idx) {
                 self.pending_menu = Some((more_rect, idx));
@@ -2964,6 +3001,70 @@ fn first_language(text: &str) -> &str {
     text
 }
 
+/// One of the outline buttons: hovered, it takes the accent colour in its
+/// border, its fill and its caption; clicked, it says so. Everything else
+/// about it stays as the picture has it.
+#[allow(clippy::too_many_arguments)]
+fn action_button(
+    ui: &mut Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    id: egui::Id,
+    caption: &str,
+    size: f32,
+    band: Rect,
+    p: &Palette,
+) -> bool {
+    let hit = rect.intersect(band);
+    let mut hovered = false;
+    let mut clicked = false;
+    if hit.is_positive() {
+        let resp = ui.interact(hit, id, Sense::click());
+        hovered = resp.hovered();
+        clicked = resp.clicked();
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    if hovered {
+        painter.rect_filled(rect, 0, p.surface);
+    }
+    painter.rect_stroke(
+        rect,
+        0,
+        if hovered {
+            Stroke::new(1.5, p.accent)
+        } else {
+            line(p.border)
+        },
+        StrokeKind::Middle,
+    );
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        caption,
+        text(size),
+        if hovered { p.accent } else { p.text },
+    );
+    clicked
+}
+
+/// The Mac's clipboard as text, read straight from `pbpaste` so pasting
+/// works even if a keyboard shortcut never reaches the field.
+fn clipboard_text() -> Option<String> {
+    let out = std::process::Command::new("pbpaste").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 /// A string shortened with an ellipsis until it fits the given width.
 fn fit_text(ui: &Ui, text_in: &str, font: egui::FontId, max_w: f32) -> String {
     if measure(ui, text_in, font.clone()) <= max_w {
@@ -3102,6 +3203,7 @@ fn main() -> eframe::Result<()> {
                         inner: App { launcher },
                         path,
                         frame: 0,
+                        pass: 0,
                         // Frames to let the worker threads answer before the
                         // picture is taken; longer waits show live data.
                         warmup: std::env::var("GITUP_SHOT_FRAMES")
@@ -3122,6 +3224,8 @@ struct ScreenshotApp {
     inner: App,
     path: std::path::PathBuf,
     frame: u32,
+    /// Frames seen by the raw-input hook, which runs before each pass.
+    pass: u32,
     warmup: u32,
     /// Set the moment the picture is on disk, so the watchdog knows it can
     /// stop the process right away.
@@ -3133,7 +3237,73 @@ impl eframe::App for ScreenshotApp {
         self.inner.clear_color(visuals)
     }
 
+    /// Test hooks for looking at the window without a mouse: GITUP_HOVER_TEST
+    /// parks the pointer somewhere, and GITUP_UI_TEST types into the
+    /// add-repository field and then presses 添加, so the whole flow can be
+    /// checked from a picture.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.pass += 1;
+        let click = |pass: u32, pos: egui::Pos2, raw_input: &mut egui::RawInput| {
+            if self.pass == pass {
+                raw_input.events.push(egui::Event::PointerMoved(pos));
+            } else if self.pass == pass + 1 {
+                raw_input.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                });
+            } else if self.pass == pass + 2 {
+                raw_input.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+        };
+        if let Ok(where_) = std::env::var("GITUP_HOVER_TEST") {
+            if self.pass == 30 {
+                let mut parts = where_.split(',');
+                let x: f32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                let y: f32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                raw_input.events.push(egui::Event::PointerMoved(egui::pos2(x, y)));
+            }
+            return;
+        }
+        if std::env::var("GITUP_UI_TEST").is_ok() {
+            if self.pass == 20 {
+                raw_input
+                    .events
+                    .push(egui::Event::PointerMoved(egui::pos2(800.0, 500.0)));
+            }
+            click(21, egui::pos2(800.0, 500.0), raw_input);
+            if self.pass == 26 {
+                raw_input.events.push(egui::Event::Text(
+                    "https://github.com/diamondfsd/luna-ai-cut".to_string(),
+                ));
+            }
+            click(40, egui::pos2(1070.0, 500.0), raw_input);
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        // A test hook: with GITUP_TYPE_TEST set, the add-repository field is
+        // focused and fed some text on one frame, so a picture can show
+        // whether it really takes keystrokes.
+        if std::env::var("GITUP_TYPE_TEST").is_ok() {
+            self.frame += 1;
+            if self.frame == 20 {
+                let id = egui::Id::unique("settings-add-field");
+                ui.ctx().memory_mut(|m| m.request_focus(id));
+                ui.ctx().input_mut(|i| {
+                    i.events.push(egui::Event::Text(
+                        "diamondfsd/luna-ai-cut".to_string(),
+                    ));
+                });
+            }
+            self.frame -= 1;
+        }
         self.inner.ui(ui, frame);
         self.frame += 1;
         if self.frame < 5 {
@@ -3171,14 +3341,13 @@ impl eframe::App for ScreenshotApp {
     }
 }
 
-/// Draws the launcher's icon: a white rounded plate, and on it a magpie
-/// in profile — black head, back and long tail, a white panel across the
-/// wing and belly, and a white glint for the eye. Every edge is smoothed
+/// Draws the launcher's icon: a green rounded plate with the head of a
+/// bird in profile on it — white, black-outlined, hatched like an
+/// engraving, with a black eye and a white glint. Every edge is smoothed
 /// with four-by-four samples per pixel. Pixels are straight RGBA, which is
 /// what the PNG writer expects.
 fn render_icon(size: usize) -> egui::ColorImage {
     let s = size as f32;
-    // A point-in-polygon test, for the bird's body and its white panel.
     let inside_poly = |x: f32, y: f32, poly: &[(f32, f32)]| -> bool {
         let mut inside = false;
         let mut j = poly.len() - 1;
@@ -3192,42 +3361,36 @@ fn render_icon(size: usize) -> egui::ColorImage {
         }
         inside
     };
-    // The bird, in canvas units: tail up and to the left, head and beak to
-    // the right, the belly line running nearly level.
-    let body: [(f32, f32); 15] = [
-        (0.150, 0.238), // tail tip, upper corner
-        (0.445, 0.424), // tail root, where it meets the back
-        (0.545, 0.415), // back
-        (0.612, 0.352), // nape
-        (0.663, 0.302), // crown
-        (0.733, 0.306), // forehead
-        (0.878, 0.366), // beak, tip
-        (0.736, 0.396), // beak, lower edge
-        (0.727, 0.428), // throat
-        (0.712, 0.478), // breast
-        (0.694, 0.552), // belly, front
-        (0.612, 0.606), // belly, underneath
-        (0.455, 0.556), // tail root, underneath
-        (0.352, 0.470), // tail, lower edge
-        (0.196, 0.300), // tail tip, lower corner
+    // The head and neck, facing right: crown, forehead, beak, throat, the
+    // notch under the beak, then straight down the front and the back.
+    let head: [(f32, f32); 13] = [
+        (0.130, 0.905), // neck, bottom left
+        (0.118, 0.330), // back of the head
+        (0.190, 0.140), // crown, rear
+        (0.320, 0.058), // crown
+        (0.480, 0.072), // brow
+        (0.600, 0.162), // forehead
+        (0.655, 0.278), // top of the beak
+        (0.905, 0.408), // beak, tip
+        (0.658, 0.472), // beak, underside
+        (0.612, 0.560), // cheek
+        (0.700, 0.678), // the notch at the throat
+        (0.636, 0.772),
+        (0.652, 0.905), // neck, bottom right
     ];
-    // The white panel the magpie carries across its wing and belly.
-    let panel: [(f32, f32); 6] = [
-        (0.398, 0.460),
-        (0.586, 0.450),
-        (0.654, 0.499),
-        (0.622, 0.547),
-        (0.470, 0.526),
-        (0.414, 0.498),
-    ];
-    // The two legs, and the little feet they end in.
-    let legs: [(f32, f32, f32, f32); 2] = [
-        (0.548, 0.596, 0.540, 0.666),
-        (0.620, 0.590, 0.626, 0.666),
-    ];
-    let feet: [(f32, f32, f32, f32); 2] = [
-        (0.505, 0.668, 0.578, 0.668),
-        (0.590, 0.668, 0.662, 0.668),
+    // The engraved hatching across the neck and cheek.
+    let hatches: [(f32, f32, f32, f32); 11] = [
+        (0.200, 0.400, 0.268, 0.516),
+        (0.272, 0.362, 0.338, 0.478),
+        (0.342, 0.452, 0.408, 0.568),
+        (0.198, 0.556, 0.266, 0.672),
+        (0.280, 0.582, 0.348, 0.698),
+        (0.360, 0.622, 0.428, 0.738),
+        (0.222, 0.700, 0.290, 0.816),
+        (0.310, 0.742, 0.378, 0.858),
+        (0.420, 0.500, 0.482, 0.604),
+        (0.440, 0.660, 0.508, 0.776),
+        (0.498, 0.300, 0.556, 0.400),
     ];
     let dist_to_seg = |x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32| -> f32 {
         let (dx, dy) = (x1 - x0, y1 - y0);
@@ -3240,16 +3403,17 @@ fn render_icon(size: usize) -> egui::ColorImage {
     };
     // The plate's rounded rectangle, as a signed distance.
     let plate_sd = |x: f32, y: f32| -> f32 {
-        let (hw, hh, r) = (0.445, 0.445, 0.205);
+        let (hw, hh, r) = (0.455, 0.455, 0.225);
         let qx = (x - 0.5).abs() - (hw - r);
         let qy = (y - 0.5).abs() - (hh - r);
         let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
         outside + qx.max(qy).min(0.0) - r
     };
-    let paper = (0.988f32, 0.988, 0.980);
-    let rim = (0.845f32, 0.845, 0.835);
-    let ink = (0.106f32, 0.106, 0.120);
-    let rim_w = 0.0038;
+    let top = (0.129f32, 0.694, 0.345); // #21B158
+    let bottom = (0.086f32, 0.600, 0.271); // #169945
+    let paper = (0.973f32, 0.973, 0.961);
+    let ink = (0.075f32, 0.078, 0.082);
+    let outline_w = 0.0135;
     let mut pixels = Vec::with_capacity(size * size);
     const N: usize = 4;
     for py in 0..size {
@@ -3260,43 +3424,52 @@ fn render_icon(size: usize) -> egui::ColorImage {
                 for sx in 0..N {
                     let x = (pxi as f32 + (sx as f32 + 0.5) / N as f32) / s;
                     let y = (py as f32 + (sy as f32 + 0.5) / N as f32) / s;
-                    let sd = plate_sd(x, y);
-                    if sd > 0.0 {
-                        // Outside the plate: nothing at all.
+                    if plate_sd(x, y) > 0.0 {
                         acc_a += 1.0;
                         continue;
                     }
-                    // The plate, with a hairline rim just inside its edge.
-                    let mut c = if sd > -rim_w {
-                        (rim.0, rim.1, rim.2, 1.0)
-                    } else {
-                        (paper.0, paper.1, paper.2, 1.0)
-                    };
-                    // The bird: a quick box test keeps most samples away
-                    // from the point-in-polygon work.
-                    let near = x > 0.13 && x < 0.90 && y > 0.27 && y < 0.68;
-                    if near && inside_poly(x, y, &body) {
-                        c = (ink.0, ink.1, ink.2, 1.0);
-                        if inside_poly(x, y, &panel) {
-                            c = (paper.0, paper.1, paper.2, 1.0);
-                        }
-                        // The eye: a paper-coloured glint on the black head.
-                        let de = ((x - 0.706).powi(2) + (y - 0.345).powi(2)).sqrt();
-                        if de < 0.0135 {
-                            c = (paper.0, paper.1, paper.2, 1.0);
-                        }
-                    }
-                    // Legs and feet, drawn over the plate.
-                    if near && y > 0.58 {
-                        for (x0, y0, x1, y1) in legs {
-                            if dist_to_seg(x, y, x0, y0, x1, y1) < 0.0055 {
-                                c = (ink.0, ink.1, ink.2, 1.0);
+                    // The plate: a green that darkens gently downwards.
+                    let t = y.clamp(0.0, 1.0);
+                    let mut c = (
+                        top.0 + (bottom.0 - top.0) * t,
+                        top.1 + (bottom.1 - top.1) * t,
+                        top.2 + (bottom.2 - top.2) * t,
+                        1.0,
+                    );
+                    // The bird, then its outline and hatching on top.
+                    let near = x > 0.09 && x < 0.93 && y > 0.03 && y < 0.93;
+                    if near {
+                        let inside = inside_poly(x, y, &head);
+                        let mut edge = false;
+                        for i in 0..head.len() {
+                            let a = head[i];
+                            let b = head[(i + 1) % head.len()];
+                            if dist_to_seg(x, y, a.0, a.1, b.0, b.1) < outline_w {
+                                edge = true;
+                                break;
                             }
                         }
-                        for (x0, y0, x1, y1) in feet {
-                            if dist_to_seg(x, y, x0, y0, x1, y1) < 0.0055 {
-                                c = (ink.0, ink.1, ink.2, 1.0);
+                        if inside {
+                            c = (paper.0, paper.1, paper.2, 1.0);
+                        }
+                        // The eye: a black bead with a white glint.
+                        let de = ((x - 0.452).powi(2) + (y - 0.252).powi(2)).sqrt();
+                        if de < 0.043 {
+                            c = (ink.0, ink.1, ink.2, 1.0);
+                        }
+                        let dg = ((x - 0.466).powi(2) + (y - 0.238).powi(2)).sqrt();
+                        if dg < 0.0125 {
+                            c = (paper.0, paper.1, paper.2, 1.0);
+                        }
+                        if inside {
+                            for (x0, y0, x1, y1) in hatches {
+                                if dist_to_seg(x, y, x0, y0, x1, y1) < 0.0072 {
+                                    c = (ink.0, ink.1, ink.2, 1.0);
+                                }
                             }
+                        }
+                        if edge {
+                            c = (ink.0, ink.1, ink.2, 1.0);
                         }
                     }
                     acc[0] += c.0 * c.3;
