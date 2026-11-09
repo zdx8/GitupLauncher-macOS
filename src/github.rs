@@ -33,7 +33,15 @@ pub enum AssetKind {
 #[derive(Clone)]
 pub struct MacAsset {
     pub name: String,
+    /// Where the bytes are fetched from. This is the API's own asset
+    /// endpoint when the release JSON offers one: it answers with a
+    /// redirect straight to GitHub's file store, so the download never
+    /// touches github.com — the host that is the first to go missing on
+    /// a network where the API still answers.
     pub url: String,
+    /// The link a browser would use, kept as a second chance and for the
+    /// day a page wants to offer it.
+    pub browser_url: String,
     /// Kept for the day the button wants to say how big the download is.
     #[allow(dead_code)]
     pub size: u64,
@@ -49,6 +57,7 @@ pub fn to_json(rel: &ReleaseInfo) -> Value {
         serde_json::json!({
             "name": a.name,
             "url": a.url,
+            "browser": a.browser_url,
             "size": a.size,
             "kind": match a.kind {
                 AssetKind::Zip => "zip",
@@ -69,9 +78,18 @@ pub fn to_json(rel: &ReleaseInfo) -> Value {
 pub fn from_json(v: &Value) -> Option<ReleaseInfo> {
     let tag = v["tag"].as_str()?.to_string();
     let asset = v.get("asset").and_then(|a| {
+        let url = a["url"].as_str()?.to_string();
+        // Caches written before the two links were kept apart have only
+        // the browser one, which still works on most networks.
+        let browser_url = a["browser"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| url.clone());
         Some(MacAsset {
             name: a["name"].as_str()?.to_string(),
-            url: a["url"].as_str()?.to_string(),
+            url,
+            browser_url,
             size: a["size"].as_u64().unwrap_or(0),
             kind: match a["kind"].as_str() {
                 Some("dmg") => AssetKind::Dmg,
@@ -138,16 +156,25 @@ fn pick_mac_asset(assets: &[Value]) -> Option<MacAsset> {
         if kind == AssetKind::Zip {
             score += 5;
         }
-        let url = a["browser_download_url"].as_str().unwrap_or_default();
-        if url.is_empty() {
+        let browser_url = a["browser_download_url"].as_str().unwrap_or_default();
+        if browser_url.is_empty() {
             continue;
         }
+        // The API's own link first: it redirects to the file store without
+        // asking github.com, which is the host that fails first.
+        let api_url = a["url"].as_str().unwrap_or_default();
+        let url = if api_url.is_empty() {
+            browser_url.to_string()
+        } else {
+            api_url.to_string()
+        };
         if best.as_ref().is_none_or(|(s, _)| score > *s) {
             best = Some((
                 score,
                 MacAsset {
                     name: name.to_string(),
-                    url: url.to_string(),
+                    url,
+                    browser_url: browser_url.to_string(),
                     size: a["size"].as_u64().unwrap_or(0),
                     kind,
                 },
@@ -311,17 +338,46 @@ pub fn fetch_repo_description(slug: &str) -> Option<String> {
 /// Stream a file to `dest`, calling `progress` with the bytes moved so far
 /// and the total when it is known. Sets the error string to "cancelled"
 /// when `cancel` was raised; the part-file is removed in that case.
+///
+/// The addresses are tried in turn, so a file can be fetched from the API
+/// endpoint when the browser link is unreachable, or the other way round.
 pub fn download_file(
-    url: &str,
+    urls: &[String],
     dest: &Path,
     cancel: &AtomicBool,
     progress: impl Fn(u64, u64),
 ) -> Result<(), String> {
-    let resp = agent()
+    let mut last = "没有可用的下载地址".to_string();
+    for url in urls {
+        match download_one(url, dest, cancel, &progress) {
+            Ok(()) => return Ok(()),
+            // A cancelled download is the person's own doing; trying the
+            // next address would ignore that.
+            Err(e) if e == "cancelled" => return Err(e),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+fn download_one(
+    url: &str,
+    dest: &Path,
+    cancel: &AtomicBool,
+    progress: &impl Fn(u64, u64),
+) -> Result<(), String> {
+    let mut req = agent()
         .get(url)
         .set("User-Agent", UA)
-        .call()
-        .map_err(|e| format!("{e}"))?;
+        // Asking for the bytes themselves makes the API answer with a
+        // redirect to the file rather than JSON about it.
+        .set("Accept", "application/octet-stream");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        if !token.trim().is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", token.trim()));
+        }
+    }
+    let resp = req.call().map_err(|e| format!("{e}"))?;
     let total: u64 = resp
         .header("Content-Length")
         .and_then(|s| s.parse().ok())

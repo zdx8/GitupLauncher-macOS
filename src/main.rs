@@ -680,7 +680,12 @@ impl Launcher {
             let _ = std::fs::create_dir_all(&dir);
             let file = dir.join(&asset.name);
             let _ = std::fs::remove_file(&file);
-            let result = github::download_file(&asset.url, &file, &cancel, |done, total| {
+            // The API's link first, the browser link as a second chance.
+            let mut urls = vec![asset.url.clone()];
+            if asset.browser_url != asset.url {
+                urls.push(asset.browser_url.clone());
+            }
+            let result = github::download_file(&urls, &file, &cancel, |done, total| {
                 let _ = tx.send(Msg::Progress { idx, done, total });
                 ctx.request_repaint();
             })
@@ -4227,6 +4232,50 @@ fn main() -> eframe::Result<()> {
                 if let Some(path) = args.next() {
                     let image = render_icon(1024);
                     write_png(std::path::Path::new(&path), &image);
+                    return Ok(());
+                }
+            }
+            // Checks one repository's newest release and downloads its
+            // asset, without opening a window: the command-line answer to
+            // "the list works but the download does not".
+            "--fetch-test" => {
+                if let Some(slug) = args.next() {
+                    match github::fetch_latest_release(&slug, false) {
+                        Ok(rel) => {
+                            println!("tag:      {}", rel.tag);
+                            match rel.asset {
+                                Some(asset) => {
+                                    println!("asset:    {} ({})", asset.name, human_size(asset.size));
+                                    println!("api url:  {}", asset.url);
+                                    println!("browser:  {}", asset.browser_url);
+                                    let dest =
+                                        std::env::temp_dir().join("gitup-fetch-test.bin");
+                                    let cancel = AtomicBool::new(false);
+                                    let started = std::time::Instant::now();
+                                    let got = github::download_file(
+                                        &[asset.url.clone(), asset.browser_url.clone()],
+                                        &dest,
+                                        &cancel,
+                                        |_, _| {},
+                                    );
+                                    let bytes = std::fs::metadata(&dest)
+                                        .map(|m| m.len())
+                                        .unwrap_or(0);
+                                    let secs = started.elapsed().as_secs_f32().max(0.001);
+                                    match got {
+                                        Ok(()) => println!(
+                                            "download: ok, {bytes} bytes in {secs:.1}s ({})",
+                                            human_speed(bytes as f32 / secs)
+                                        ),
+                                        Err(e) => println!("download: failed — {e}"),
+                                    }
+                                    let _ = std::fs::remove_file(&dest);
+                                }
+                                None => println!("this release has no macOS asset"),
+                            }
+                        }
+                        Err(e) => println!("release:  failed — {e}"),
+                    }
                     return Ok(());
                 }
             }
