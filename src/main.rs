@@ -445,9 +445,10 @@ impl Launcher {
             return;
         }
         let slug = list[idx].slug.to_string();
+        let id = list[idx].id.to_string();
         catalog::remove_custom(&slug);
         self.settings.custom.retain(|s| s != &slug);
-        self.settings.disabled.retain(|d| d != &slug);
+        self.settings.disabled.retain(|d| d != &id);
         state::save_settings(&self.settings);
         self.rebuild_repos();
         self.state.status = format!("已移除订阅 {slug}");
@@ -2156,6 +2157,7 @@ impl Launcher {
     /// happened at all.
     fn import_repositories(&mut self, text: &str) -> (usize, usize, usize) {
         let mut added = 0usize;
+        let mut restored = 0usize;
         let mut known = 0usize;
         let mut bad: Vec<String> = Vec::new();
         for line in text.lines() {
@@ -2163,13 +2165,29 @@ impl Launcher {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            // An address that is already in the list but switched off is
+            // switched back on rather than refused — this is where a
+            // subscription deleted earlier is added again. The switched-off
+            // list holds repository ids, not slugs.
+            if let Some(idx) = catalog::lookup(line) {
+                let id = repos()[idx].id.to_string();
+                if self.settings.disabled.iter().any(|d| d == &id) {
+                    self.settings.disabled.retain(|d| d != &id);
+                    self.state.subscribed[idx] = true;
+                    restored += 1;
+                } else {
+                    known += 1;
+                }
+                continue;
+            }
             match catalog::add_custom(line) {
                 Ok(idx) => {
+                    let id = repos()[idx].id.to_string();
                     let slug = repos()[idx].slug.to_string();
                     if !self.settings.custom.iter().any(|s| s == &slug) {
-                        self.settings.custom.push(slug.clone());
+                        self.settings.custom.push(slug);
                     }
-                    self.settings.disabled.retain(|d| d != &slug);
+                    self.settings.disabled.retain(|d| d != &id);
                     added += 1;
                 }
                 Err(e) => {
@@ -2182,17 +2200,28 @@ impl Launcher {
             }
         }
         state::save_settings(&self.settings);
-        if added > 0 {
+        if added > 0 || restored > 0 {
             self.rebuild_repos();
             self.pending_scroll_end = true;
         }
-        let mut report = format!("已导入 {added} 个仓库");
+        let mut parts: Vec<String> = Vec::new();
+        if added > 0 {
+            parts.push(format!("新增 {added} 个"));
+        }
+        if restored > 0 {
+            parts.push(format!("恢复订阅 {restored} 个"));
+        }
         if known > 0 {
-            report.push_str(&format!("，{known} 个此前已经订阅"));
+            parts.push(format!("{known} 个此前已经订阅"));
         }
         if !bad.is_empty() {
-            report.push_str(&format!("，{} 行无法识别", bad.len()));
+            parts.push(format!("{} 行无法识别", bad.len()));
         }
+        let report = if parts.is_empty() {
+            "没有可添加的地址".to_string()
+        } else {
+            format!("已导入：{}", parts.join("，"))
+        };
         self.state.status = report.clone();
         if let Some(batch) = self.batch.as_mut() {
             batch.report = Some(if bad.is_empty() {
@@ -2201,7 +2230,7 @@ impl Launcher {
                 format!("{report}\n\n{}", bad.join("\n"))
             });
         }
-        (added, known, bad.len())
+        (added + restored, known, bad.len())
     }
 
     /// The importer: a single address by default, or a whole list once
@@ -4462,6 +4491,30 @@ impl eframe::App for ScreenshotApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        // A test hook: with GITUP_READD_TEST set, a built-in subscription is
+        // switched off and its address is added again, which must put it
+        // back on rather than answer "already subscribed".
+        if std::env::var("GITUP_READD_TEST").is_ok() && self.frame == 6 {
+            let idx = 2usize;
+            let slug = repos()[idx].slug.to_string();
+            let id = repos()[idx].id.to_string();
+            if !self
+                .inner
+                .launcher
+                .settings
+                .disabled
+                .iter()
+                .any(|d| d == &id)
+            {
+                self.inner.launcher.toggle_subscription(idx);
+            }
+            let off = self.inner.launcher.state.subscribed[idx];
+            let (added, known, bad) = self.inner.launcher.import_repositories(&slug);
+            let on = self.inner.launcher.state.subscribed[idx];
+            eprintln!(
+                "readd {slug}: subscribed_before_import={off} -> added={added} known={known} bad={bad} subscribed_now={on}"
+            );
+        }
         // A test hook: with GITUP_DEL_TEST set, a repository the person
         // added is removed on one frame, so a picture can show whether the
         // settings page stays where it is.

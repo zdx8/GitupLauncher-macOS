@@ -233,6 +233,17 @@ fn reduce_to_slug(input: &str) -> String {
     }
 }
 
+/// Where a pasted address sits in the live list, if it is there at all.
+/// The address is reduced the same way `add_custom` reduces it, so a full
+/// URL, a `/releases` deep link and a bare `owner/repo` all find the same
+/// entry.
+pub fn lookup(input: &str) -> Option<usize> {
+    let slug = reduce_to_slug(input);
+    repos()
+        .iter()
+        .position(|r| r.slug.eq_ignore_ascii_case(&slug))
+}
+
 /// Check that something typed in looks like `owner/repo` and is not
 /// already being managed.
 fn check_new_slug(slug: &str) -> Result<String, String> {
