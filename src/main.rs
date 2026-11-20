@@ -16,11 +16,15 @@
 //! a card's tile opens that app's own page, with its features and its
 //! newest release's changelog.
 
+mod app_icon;
 mod catalog;
 mod fonts;
 mod github;
 mod icon;
 mod install;
+mod modals_ui;
+mod self_update;
+mod settings_ui;
 mod state;
 mod theme;
 mod version;
@@ -34,17 +38,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use theme::*;
 
-/// The height of the top bar. The picture puts its lower rule at 47 pt.
-const TOPBAR_H: f32 = 47.0;
-/// The height of the toolbar. The picture puts the search box's lower rule
-/// at 99 pt, and the cards start at 124 pt.
-const TOOLBAR_H: f32 = 77.0;
-/// The height of the footer strip. The picture puts its upper rule at 726 pt.
-const FOOTER_H: f32 = 34.0;
+/// The height of the top bar.
+const TOPBAR_H: f32 = 44.0;
+/// The height of the toolbar above the card grid.
+const TOOLBAR_H: f32 = 50.0;
+/// The height of the footer strip.
+const FOOTER_H: f32 = 30.0;
 /// Where the wordmark starts, clear of the traffic lights.
 const WORDMARK_X: f32 = 92.0;
-/// The height of the strip at the top of a card (its rule is at 163 pt).
-const CARD_HEAD_H: f32 = 39.0;
 /// A few addresses, for the bulk importer's demo screen.
 const SAMPLE_LIST: &str = "https://github.com/diamondfsd/luna-ai-cut
 zdx8/NetScope-macOS
@@ -52,18 +53,22 @@ zdx8/NetScope-macOS
 不是链接的一行";
 
 /// The height of the 未安装 heading in the grid.
-const SECTION_H: f32 = 42.0;
+const SECTION_H: f32 = 32.0;
 /// The width of one card's app tile.
-const TILE: f32 = 56.0;
-/// How many cards sit side by side.
-const COLUMNS: usize = 3;
-/// The grid's margin at each side; the picture puts the edges at 20 pt.
-const MARGIN: f32 = 20.0;
+const TILE: f32 = 44.0;
+/// Balanced card height so 3 full rows fit comfortably in the default window.
+const CARD_H: f32 = 192.0;
+/// Gap between cards in the grid.
+const CARD_GAP: f32 = 12.0;
+/// Minimum width of a single card when computing responsive column count.
+const CARD_MIN_W: f32 = 274.0;
+/// The grid's margin at each side.
+pub(crate) const MARGIN: f32 = 20.0;
 /// The side margin of the detail page.
-const DETAIL_MARGIN: f32 = 20.0;
+pub(crate) const DETAIL_MARGIN: f32 = 20.0;
 /// How much room the detail page keeps clear on its right, so its own
 /// scrollbar never sits on a button.
-const RIGHT_GUTTER: f32 = 34.0;
+pub(crate) const RIGHT_GUTTER: f32 = 32.0;
 
 /// Which of the other screens to show when the window opens.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -83,96 +88,74 @@ enum Demo {
 
 /// The importer: one address, or a whole list of them, and what came of
 /// the list when it was added.
-struct Batch {
-    /// What is in the one-line box, while the list box is closed.
-    single: String,
-    /// The list, in the many-line box.
-    text: String,
-    /// What happened, once the list has been read.
-    report: Option<String>,
-    /// Whether the many-line box is showing instead of the one-line one.
-    expanded: bool,
-    /// Set when the box is opened, so the keyboard goes straight into it
-    /// and a paste lands there without a click.
-    focus: bool,
+pub(crate) struct Batch {
+    pub(crate) single: String,
+    pub(crate) text: String,
+    pub(crate) report: Option<String>,
+    pub(crate) expanded: bool,
+    pub(crate) focus: bool,
 }
 
 /// The version chooser: one app's releases, with the one being looked at.
-struct Picker {
-    idx: usize,
-    loading: bool,
-    error: Option<String>,
-    list: Vec<github::ReleaseInfo>,
-    chosen: usize,
-    /// Whether the drop-down is open.
-    open: bool,
+pub(crate) struct Picker {
+    pub(crate) idx: usize,
+    pub(crate) loading: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) list: Vec<github::ReleaseInfo>,
+    pub(crate) chosen: usize,
+    pub(crate) open: bool,
 }
 
 /// What the window is showing: the grid, one app's page, or settings.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Page {
+pub(crate) enum Page {
     Grid,
     Detail(usize),
     Settings,
 }
 
-struct Launcher {
-    state: State,
-    /// The screen shown first, for looking at the other views.
+/// Quick filter pills in the main toolbar.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Filter {
+    All,
+    Installed,
+    Updatable,
+}
+
+pub(crate) struct Launcher {
+    pub(crate) state: State,
     demo: Demo,
-    /// Where the little menu is drawn, once the cards are done.
     pending_menu: Option<(Rect, usize)>,
-    /// Where the sort dropdown is drawn, once the cards are done.
     pending_sort: Option<Rect>,
     search: String,
-    /// The card whose small menu is open.
-    menu_for: Option<usize>,
-    /// Which sort the dropdown is showing.
-    sort_open: bool,
-    /// What the worker threads report back through.
+    filter: Filter,
+    pub(crate) menu_for: Option<usize>,
+    pub(crate) sort_open: bool,
     tx: std::sync::mpsc::Sender<Msg>,
     rx: std::sync::mpsc::Receiver<Msg>,
-    /// A handle the workers use to ask for another frame.
-    ctx: egui::Context,
-    /// Each app's own icon, once it has been read off the disk; a card
-    /// falls back to its drawn mark until then.
+    pub(crate) ctx: egui::Context,
     icons: Vec<Option<egui::TextureHandle>>,
-    /// For each icon, the texture coordinates of the artwork inside its
-    /// transparent padding, so the picture can fill the whole tile.
     icon_uv: Vec<(f32, f32, f32, f32)>,
-    /// What the window is showing.
-    page: Page,
-    /// How far the detail page is scrolled down.
+    pub(crate) page: Page,
     detail_scroll: f32,
-    /// Whether the detail page's changelog shows every entry.
+    pub(crate) settings_scroll: f32,
     detail_expanded: bool,
-    /// What the person has set, kept between runs.
-    settings: state::Settings,
-    /// Each repository's own description, kept on disk so the API is
-    /// asked at most once per repository.
+    pub(crate) settings: state::Settings,
+    pub(crate) self_update: self_update::SelfUpdateState,
     descriptions: std::collections::BTreeMap<String, String>,
-    /// The last release read for each repository, kept on disk. It is what
-    /// the cards show while the network is still answering, and what they
-    /// fall back to when GitHub refuses to answer at all.
     releases: std::collections::BTreeMap<String, serde_json::Value>,
-    /// A card to draw as though the pointer were over it. Only set by the
-    /// hover demo, so the accent frame can be checked in a picture.
+    /// Cached HTTP ETags per repository slug for 304 Not Modified responses.
+    pub(crate) etags: std::collections::BTreeMap<String, String>,
+    /// Cached 2-line clamped descriptions keyed by (slug, width_px, summary_len).
+    clamp_cache: std::collections::HashMap<(String, u32, usize), String>,
     hover_demo: Option<usize>,
-    /// Set after a repository is added, so the grid scrolls to the end and
-    /// the new card is actually on screen.
     pending_scroll_end: bool,
-    /// The version chooser, when it is open.
-    picker: Option<Picker>,
-    /// The bulk importer, when it is open.
-    batch: Option<Batch>,
-    /// Whether the window is zoomed, as the window system last reported it.
-    /// Double-clicking the bar reads this to know which way to go.
+    pub(crate) picker: Option<Picker>,
+    pub(crate) batch: Option<Batch>,
     window_zoomed: bool,
-    /// Where the search field sits, in window coordinates. A drag there is
-    /// a text selection, not a window drag.
     search_rect: Rect,
-    /// Whether dragging the window's background has been switched off, so
-    /// the window system is only told when the answer changes.
+    /// Text input rects on the settings page (token, install_dir) to suppress window drag.
+    pub(crate) settings_text_rects: [Rect; 2],
     drag_blocked: bool,
 }
 
@@ -198,13 +181,14 @@ impl Launcher {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut state = State::new();
         // Local and quick: what is already on this Mac.
-        state.rescan_installed();
+        state.rescan_installed(&settings.install_dir, &settings.bundle_overrides);
         let mut launcher = Self {
             state,
             demo: Demo::None,
             pending_menu: None,
             pending_sort: None,
             search: String::new(),
+            filter: Filter::All,
             menu_for: None,
             sort_open: false,
             tx,
@@ -214,16 +198,21 @@ impl Launcher {
             icon_uv: repos().iter().map(|_| (0.0, 0.0, 1.0, 1.0)).collect(),
             page: Page::Grid,
             detail_scroll: 0.0,
+            settings_scroll: 0.0,
             detail_expanded: false,
             settings,
+            self_update: self_update::SelfUpdateState::Idle,
             descriptions: load_descriptions(),
             releases: load_releases(),
+            etags: load_etags(),
+            clamp_cache: std::collections::HashMap::new(),
             hover_demo: None,
             pending_scroll_end: false,
             picker: None,
             batch: None,
             window_zoomed: false,
             search_rect: Rect::NOTHING,
+            settings_text_rects: [Rect::NOTHING, Rect::NOTHING],
             drag_blocked: false,
         };
         // A repository the person added is either in the list or deleted,
@@ -244,6 +233,7 @@ impl Launcher {
         }
         if launcher.settings.auto_check {
             launcher.spawn_meta_fetch_all();
+            launcher.check_self_update();
         } else {
             launcher.state.status = "未自动检查更新，点左上角按钮立即检查".to_string();
         }
@@ -253,7 +243,7 @@ impl Launcher {
 
     /// Whether this repository is subscribed, and a toggle that keeps the
     /// setting file in step.
-    fn toggle_subscription(&mut self, idx: usize) {
+    pub(crate) fn toggle_subscription(&mut self, idx: usize) {
         let id = repos()[idx].id;
         let on = !self.settings.disabled.iter().any(|d| d == id);
         if on {
@@ -268,6 +258,12 @@ impl Launcher {
         state::save_settings(&self.settings);
     }
 
+    /// Effective `.app` bundle name for repository `idx`.
+    fn bundle_name(&self, idx: usize) -> String {
+        let repo = repos()[idx];
+        state::effective_bundle(repo.slug, repo.bundle, &self.settings.bundle_overrides).to_string()
+    }
+
     /// Leave whatever pop-ups are open and show an app's page.
     fn open_page(&mut self, idx: usize) {
         self.page = Page::Detail(idx);
@@ -277,9 +273,7 @@ impl Launcher {
         self.sort_open = false;
     }
 
-    /// One app's tile, wherever it is drawn. The app's own icon covers
-    /// the whole tile with no colour behind it; an app without one gets
-    /// its first letter on a colour drawn from its id.
+    /// One app's tile, wherever it is drawn.
     fn draw_tile(&self, painter: &egui::Painter, tile: Rect, idx: usize, corner: u8) {
         if let Some(texture) = self.icons.get(idx).and_then(|t| t.as_ref()) {
             let (u0, v0, u1, v1) = self.icon_uv[idx];
@@ -303,26 +297,31 @@ impl Launcher {
         }
     }
 
-    /// Read every installed app's own icon, off the window's thread. The
-    /// answers arrive as `Msg::Icon` and become textures on the next
-    /// frame; an app without an installed copy keeps its drawn mark.
-    fn spawn_icon_load(&mut self) {
+    /// Read every installed app's own icon off the UI thread (with disk PNG cache).
+    pub(crate) fn spawn_icon_load(&mut self) {
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
+        let install_dir = self.settings.install_dir.clone();
         let bundles: Vec<(usize, String)> = repos()
             .iter()
             .enumerate()
             .filter(|(i, _)| self.state.is_installed(*i))
-            .map(|(i, repo)| (i, repo.bundle.to_string()))
+            .map(|(i, repo)| {
+                let b = state::effective_bundle(
+                    repo.slug,
+                    repo.bundle,
+                    &self.settings.bundle_overrides,
+                )
+                .to_string();
+                (i, b)
+            })
             .collect();
         std::thread::spawn(move || {
             for (idx, bundle) in bundles {
-                let Some(bytes) = install::bundle_icon_png(&bundle) else {
+                let Some(bytes) = install::bundle_icon_png(&bundle, &install_dir) else {
                     continue;
                 };
                 if let Ok((width, height, mut rgba)) = icon::decode_png_rgba(&bytes) {
-                    // An icon that ships on a white canvas would otherwise
-                    // drop a white card into the tile.
                     icon::clear_white_plate(width, height, &mut rgba);
                     let uv = icon::artwork_uv(width, height, &rgba);
                     let _ = tx.send(Msg::Icon {
@@ -338,11 +337,16 @@ impl Launcher {
         });
     }
 
-    /// Ask GitHub about every repository, each on its own thread.
-    fn spawn_meta_fetch_all(&mut self) {
+    /// Ask GitHub about every subscribed repository, using ETag conditional requests.
+    pub(crate) fn spawn_meta_fetch_all(&mut self) {
         self.state.set_all_fetching();
         self.state.status = "正在检查更新…".to_string();
         let include_pre = self.settings.include_pre;
+        let token = if self.settings.github_token.trim().is_empty() {
+            None
+        } else {
+            Some(self.settings.github_token.clone())
+        };
         for idx in 0..repos().len() {
             if !self.state.subscribed[idx] {
                 continue;
@@ -350,12 +354,23 @@ impl Launcher {
             let tx = self.tx.clone();
             let ctx = self.ctx.clone();
             let slug = repos()[idx].slug.to_string();
-            let cached = self.descriptions.contains_key(&slug);
+            let cached_desc = self.descriptions.contains_key(&slug);
+            let etag = if self.releases.contains_key(&slug) {
+                self.etags.get(&slug).cloned()
+            } else {
+                None
+            };
+            let tok = token.clone();
             std::thread::spawn(move || {
-                let result = github::fetch_latest_release(&slug, include_pre);
+                let result = github::fetch_latest_release(
+                    &slug,
+                    include_pre,
+                    etag.as_deref(),
+                    tok.as_deref(),
+                );
                 let _ = tx.send(Msg::Meta { idx, result });
-                if !cached {
-                    if let Some(text) = github::fetch_repo_description(&slug) {
+                if !cached_desc {
+                    if let Some(text) = github::fetch_repo_description(&slug, tok.as_deref()) {
                         let _ = tx.send(Msg::Description { slug, text });
                     }
                 }
@@ -364,15 +379,7 @@ impl Launcher {
         }
     }
 
-
-
-
     /// Rebuild every per-row table after the live list has changed shape.
-    /// Any running download is cancelled first, so no late message lands
-    /// on the wrong row. The screen being looked at stays as it was — the
-    /// settings page, in particular, is where a repository gets removed
-    /// from — unless it was one app's page, whose index the change may
-    /// have moved.
     fn rebuild_repos(&mut self) {
         for repo in self.state.repos.iter() {
             if let Some(job) = &repo.job {
@@ -389,32 +396,27 @@ impl Launcher {
         for (i, repo) in repos().iter().enumerate() {
             fresh.subscribed[i] = !self.settings.disabled.iter().any(|d| d == repo.id);
         }
-        fresh.rescan_installed();
+        fresh.rescan_installed(&self.settings.install_dir, &self.settings.bundle_overrides);
         self.state = fresh;
         self.icons = repos().iter().map(|_| None).collect();
         self.icon_uv = repos().iter().map(|_| (0.0, 0.0, 1.0, 1.0)).collect();
+        self.clamp_cache.clear();
         self.page = page;
         self.spawn_meta_fetch_all();
         self.spawn_icon_load();
     }
 
-    /// Add a repository typed into the settings page. It joins the list
-    /// by the same rules as everything else: its newest release is read
-    /// straight away, its installed copy is looked for, and its icon is
-    /// loaded if the app is already here.
-
-    /// Move the installed app to the Bin. The subscription stays, so the
-    /// card turns back into 安装 and the app can be put back with one click.
-    fn uninstall(&mut self, idx: usize) {
-        for repo in self.state.repos.iter() {
-            if let Some(job) = &repo.job {
-                job.cancel.store(true, Ordering::SeqCst);
-            }
+    /// Move the installed app to the Bin. The subscription stays.
+    pub(crate) fn uninstall(&mut self, idx: usize) {
+        if let Some(job) = self.state.repos.get(idx).and_then(|r| r.job.as_ref()) {
+            job.cancel.store(true, Ordering::SeqCst);
         }
         let name = repos()[idx].name;
-        match install::uninstall_app(repos()[idx].bundle) {
+        let bundle = self.bundle_name(idx);
+        match install::uninstall_app(&bundle, &self.settings.install_dir) {
             Ok(()) => {
-                self.state.rescan_installed();
+                self.state
+                    .rescan_installed(&self.settings.install_dir, &self.settings.bundle_overrides);
                 self.state.status = format!("已卸载 {name}（订阅保留）");
             }
             Err(e) => self.state.status = format!("卸载 {name} 失败: {e}"),
@@ -422,7 +424,7 @@ impl Launcher {
     }
 
     /// Drop the subscription only: whatever is installed stays installed.
-    fn delete_subscription(&mut self, idx: usize) {
+    pub(crate) fn delete_subscription(&mut self, idx: usize) {
         let name = repos()[idx].name;
         let builtin = catalog::is_builtin(repos()[idx].slug);
         if builtin {
@@ -433,9 +435,8 @@ impl Launcher {
         self.state.status = format!("已删除订阅 {name}（已安装的 {name}.app 保留）");
     }
 
-    /// Remove a repository the person added. Built-ins are only ever
-    /// switched off, never deleted.
-    fn remove_repository(&mut self, idx: usize) {
+    /// Remove a repository the person added. Built-ins are only ever switched off.
+    pub(crate) fn remove_repository(&mut self, idx: usize) {
         let list = repos();
         if idx >= list.len() || catalog::is_builtin(list[idx].slug) {
             return;
@@ -445,9 +446,11 @@ impl Launcher {
             return;
         }
         let slug = list[idx].slug.to_string();
+        let id = list[idx].id.to_string();
         catalog::remove_custom(&slug);
         self.settings.custom.retain(|s| s != &slug);
-        self.settings.disabled.retain(|d| d != &slug);
+        self.settings.disabled.retain(|d| d != &id);
+        self.settings.bundle_overrides.remove(&slug);
         state::save_settings(&self.settings);
         self.rebuild_repos();
         self.state.status = format!("已移除订阅 {slug}");
@@ -468,6 +471,11 @@ impl Launcher {
         let q = self.search.trim().to_lowercase();
         let mut list: Vec<usize> = (0..repos().len())
             .filter(|&i| self.state.subscribed[i])
+            .filter(|&i| match self.filter {
+                Filter::All => true,
+                Filter::Installed => self.state.is_installed(i),
+                Filter::Updatable => self.state.has_update(i),
+            })
             .filter(|&i| {
                 let a = &repos()[i];
                 q.is_empty()
@@ -499,25 +507,52 @@ impl Launcher {
     }
 
     /// What the big button on a card reads for this repository.
-    fn button_label(&self, idx: usize) -> &str {
+    fn button_label(&self, idx: usize) -> String {
         if let Some(job) = self.state.repos[idx].job.as_ref() {
             if job.phase == JobPhase::Installing {
-                "正在安装…"
+                "正在安装…".to_string()
+            } else if job.total > 0 {
+                let pct = (job.progress * 100.0).round().clamp(0.0, 100.0) as u8;
+                format!("下载中 {pct}%")
             } else {
-                "正在下载…"
+                "正在下载…".to_string()
             }
         } else if self.state.has_update(idx) {
-            "更新"
+            "更新".to_string()
         } else if self.state.is_installed(idx) {
-            "打开"
+            "打开".to_string()
         } else {
-            "安装"
+            "安装".to_string()
+        }
+    }
+
+    /// Start updating every subscribed app that currently has an update waiting.
+    fn update_all(&mut self) {
+        let targets: Vec<usize> = (0..repos().len())
+            .filter(|&i| {
+                self.state.subscribed[i] && self.state.has_update(i) && !self.state.busy(i)
+            })
+            .collect();
+        if targets.is_empty() {
+            self.state.status = "所有已安装应用均为最新版本".to_string();
+            return;
+        }
+        let count = targets.len();
+        for idx in targets {
+            self.start_job(idx);
+        }
+        if count > 1 {
+            self.state.status = format!("正在下载 {count} 个应用的更新…");
         }
     }
 
     /// Take whatever the worker threads have said since the last frame.
     fn handle_messages(&mut self) {
         let mut done_seen = false;
+        let mut releases_dirty = false;
+        let mut etags_dirty = false;
+        let mut desc_dirty = false;
+        let mut settings_dirty = false;
         while let Ok(msg) = self.rx.try_recv() {
             // A list resize may have left an old answer on the way; it
             // must not land on whatever row happens to sit at that index.
@@ -526,19 +561,25 @@ impl Launcher {
                 Msg::Meta { idx, result } if idx_ok(idx, &self.state.repos) => {
                     let slug = repos()[idx].slug.to_string();
                     match result {
-                        Ok(rel) => {
-                            // Fresh from GitHub: keep it, so the next run
-                            // and any rate-limited spell can use it.
-                            self.releases
-                                .insert(slug, github::to_json(&rel));
-                            save_releases(&self.releases);
-                            self.state.apply_meta(idx, Ok(rel));
+                        Ok(github::ReleaseFetch::Fresh { info, etag }) => {
+                            self.releases.insert(slug.clone(), github::to_json(&info));
+                            releases_dirty = true;
+                            if let Some(tag) = etag {
+                                self.etags.insert(slug, tag);
+                                etags_dirty = true;
+                            }
+                            self.state.apply_meta(idx, Ok(info));
                         }
-                        Err(e) => match self
-                            .releases
-                            .get(&slug)
-                            .and_then(github::from_json)
-                        {
+                        Ok(github::ReleaseFetch::NotModified) => {
+                            if let Some(rel) = self.releases.get(&slug).and_then(github::from_json)
+                            {
+                                self.state.apply_meta(idx, Ok(rel));
+                            } else {
+                                self.etags.remove(&slug);
+                                etags_dirty = true;
+                            }
+                        }
+                        Err(e) => match self.releases.get(&slug).and_then(github::from_json) {
                             Some(rel) => {
                                 self.state.apply_meta(idx, Ok(rel));
                                 self.state.status =
@@ -554,10 +595,18 @@ impl Launcher {
                 Msg::Installing { idx } if idx_ok(idx, &self.state.repos) => {
                     self.state.apply_installing(idx)
                 }
-                Msg::Done { idx, result } if idx_ok(idx, &self.state.repos) => {
+                Msg::Done { idx, bundle, result } if idx_ok(idx, &self.state.repos) => {
                     let name = repos()[idx].name;
                     match result {
                         Ok(ver) => {
+                            if let Some(actual) = bundle {
+                                if actual != repos()[idx].bundle {
+                                    self.settings
+                                        .bundle_overrides
+                                        .insert(repos()[idx].slug.to_string(), actual);
+                                    settings_dirty = true;
+                                }
+                            }
                             let was_installed = self.state.repos[idx].installed.is_some();
                             if !ver.is_empty() {
                                 self.state.repos[idx].installed = Some(ver);
@@ -615,22 +664,218 @@ impl Launcher {
                     }
                 }
                 Msg::Description { slug, text } => {
+                    self.clamp_cache.retain(|(s, _, _), _| s != &slug);
                     self.descriptions.insert(slug, text);
-                    save_descriptions(&self.descriptions);
+                    desc_dirty = true;
+                }
+                Msg::SelfUpdateChecked(res) => match res {
+                    Ok(github::ReleaseFetch::Fresh { info, .. }) => {
+                        let cur = version::parse_version(self_update::current_version());
+                        let latest = version::parse_version(&info.tag);
+                        if matches!((cur, latest), (Some(a), Some(b)) if a < b)
+                            && info.asset.is_some()
+                        {
+                            let tag = version::clean_tag(&info.tag).to_uppercase();
+                            self.self_update = self_update::SelfUpdateState::Available(info);
+                            if self.settings.self_auto_update
+                                && self_update::current_app_bundle().is_some()
+                            {
+                                self.start_self_update_download();
+                            } else {
+                                self.state.status =
+                                    format!("发现 Gitup Launcher 新版本 V{tag}，点击右上角即可更新");
+                            }
+                        } else {
+                            self.self_update = self_update::SelfUpdateState::UpToDate;
+                        }
+                    }
+                    Ok(github::ReleaseFetch::NotModified) => {
+                        self.self_update = self_update::SelfUpdateState::UpToDate;
+                    }
+                    Err(e) => {
+                        self.self_update = self_update::SelfUpdateState::Error(e);
+                    }
+                },
+                Msg::SelfUpdateProgress { done, total } => {
+                    if let self_update::SelfUpdateState::Downloading {
+                        done: d,
+                        total: t,
+                        ..
+                    } = &mut self.self_update
+                    {
+                        *d = done;
+                        *t = total;
+                    }
+                }
+                Msg::SelfUpdateStaging => {
+                    if matches!(self.self_update, self_update::SelfUpdateState::Downloading { .. }) {
+                        self.self_update = self_update::SelfUpdateState::Staging;
+                    }
+                }
+                Msg::SelfUpdateReady {
+                    version,
+                    staged_app,
+                    staging_dir,
+                } => {
+                    self.state.status = format!(
+                        "Gitup Launcher V{} 已就绪，点击右上角即可重启更新",
+                        version.to_uppercase()
+                    );
+                    self.self_update = self_update::SelfUpdateState::Ready {
+                        version,
+                        staged_app,
+                        staging_dir,
+                    };
+                }
+                Msg::SelfUpdateError(e) => {
+                    if e == "cancelled" {
+                        self.state.status = "已取消启动器更新".to_string();
+                        self.self_update = self_update::SelfUpdateState::Idle;
+                    } else {
+                        self.state.status = format!("启动器更新失败: {e}");
+                        self.self_update = self_update::SelfUpdateState::Error(e);
+                    }
                 }
                 // Anything arriving for a row that no longer exists is
                 // simply dropped.
                 _ => {}
             }
         }
+        if releases_dirty {
+            save_releases(&self.releases);
+        }
+        if etags_dirty {
+            save_etags(&self.etags);
+        }
+        if desc_dirty {
+            save_descriptions(&self.descriptions);
+        }
+        if settings_dirty {
+            state::save_settings(&self.settings);
+        }
         if done_seen {
-            self.state.rescan_installed();
+            self.state
+                .rescan_installed(&self.settings.install_dir, &self.settings.bundle_overrides);
             // A freshly installed app can now show its own icon.
             self.spawn_icon_load();
         }
     }
 
-    /// Download the newest release and put it in /Applications.
+    /// Check GitHub Releases for a newer version of Gitup Launcher itself.
+    pub(crate) fn check_self_update(&mut self) {
+        if self.self_update.is_busy() {
+            return;
+        }
+        self.self_update = self_update::SelfUpdateState::Checking;
+        let slug = self_update::self_repo_slug();
+        let include_pre = self.settings.include_pre;
+        let token = if self.settings.github_token.trim().is_empty() {
+            None
+        } else {
+            Some(self.settings.github_token.clone())
+        };
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let res = github::fetch_latest_release(&slug, include_pre, None, token.as_deref());
+            let _ = tx.send(Msg::SelfUpdateChecked(res));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Download and stage the available self-update release off the UI thread.
+    pub(crate) fn start_self_update_download(&mut self) {
+        let rel = match &self.self_update {
+            self_update::SelfUpdateState::Available(r) => r.clone(),
+            _ => return,
+        };
+        let Some(asset) = rel.asset.clone() else {
+            self.self_update =
+                self_update::SelfUpdateState::Error("该版本未提供 macOS 安装包".to_string());
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let version = version::clean_tag(&rel.tag);
+        self.self_update = self_update::SelfUpdateState::Downloading {
+            done: 0,
+            total: asset.size,
+            cancel: cancel.clone(),
+        };
+        let token = if self.settings.github_token.trim().is_empty() {
+            None
+        } else {
+            Some(self.settings.github_token.clone())
+        };
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let dir = std::env::temp_dir().join("gitup-launcher/self-update");
+            let _ = std::fs::create_dir_all(&dir);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let file = dir.join(format!("self-{stamp}-{}", asset.name));
+            let mut urls = vec![asset.url.clone()];
+            if asset.browser_url != asset.url {
+                urls.push(asset.browser_url.clone());
+            }
+            let dl = github::download_file(
+                &urls,
+                &file,
+                token.as_deref(),
+                &cancel,
+                |done, total| {
+                    let _ = tx.send(Msg::SelfUpdateProgress { done, total });
+                    ctx.request_repaint();
+                },
+            );
+            let outcome = dl.and_then(|_| {
+                let _ = tx.send(Msg::SelfUpdateStaging);
+                ctx.request_repaint();
+                self_update::stage_update(&file, asset.kind)
+            });
+            let _ = std::fs::remove_file(&file);
+            match outcome {
+                Ok((staged_app, staging_dir)) => {
+                    let _ = tx.send(Msg::SelfUpdateReady {
+                        version,
+                        staged_app,
+                        staging_dir,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::SelfUpdateError(e));
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Swap the staged `.app` into place via a detached helper and relaunch.
+    pub(crate) fn apply_self_update_and_relaunch(&mut self) {
+        let (staged_app, staging_dir) = match &self.self_update {
+            self_update::SelfUpdateState::Ready {
+                staged_app,
+                staging_dir,
+                ..
+            } => (staged_app.clone(), staging_dir.clone()),
+            _ => return,
+        };
+        match self_update::apply_and_relaunch(
+            &staged_app,
+            &staging_dir,
+            &self.settings.install_dir,
+        ) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                self.state.status = format!("重启更新失败: {e}");
+                self.self_update = self_update::SelfUpdateState::Error(e);
+            }
+        }
+    }
+
+    /// Download the newest release and install it into the configured directory.
     fn start_job(&mut self, idx: usize) {
         if self.state.busy(idx) {
             return;
@@ -657,7 +902,7 @@ impl Launcher {
 
     /// Download and install one particular asset. The version chooser uses
     /// this to install a release that is not the newest.
-    fn start_download(&mut self, idx: usize, asset: github::MacAsset) {
+    pub(crate) fn start_download(&mut self, idx: usize, asset: github::MacAsset) {
         if self.state.busy(idx) {
             return;
         }
@@ -674,31 +919,64 @@ impl Launcher {
         self.state.status = format!("正在下载 {}…", repos()[idx].name);
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
-        let bundle = repos()[idx].bundle.to_string();
+        let bundle = self.bundle_name(idx);
+        let install_dir = self.settings.install_dir.clone();
+        let preserve_name = !catalog::is_builtin(repos()[idx].slug);
+        let token = if self.settings.github_token.trim().is_empty() {
+            None
+        } else {
+            Some(self.settings.github_token.clone())
+        };
         std::thread::spawn(move || {
             let dir = std::env::temp_dir().join("gitup-launcher/download");
             let _ = std::fs::create_dir_all(&dir);
-            let file = dir.join(&asset.name);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let file = dir.join(format!("{idx}-{stamp}-{}", asset.name));
             let _ = std::fs::remove_file(&file);
-            let result = github::download_file(&asset.url, &file, &cancel, |done, total| {
-                let _ = tx.send(Msg::Progress { idx, done, total });
-                ctx.request_repaint();
-            })
+            // The API's link first, the browser link as a second chance.
+            let mut urls = vec![asset.url.clone()];
+            if asset.browser_url != asset.url {
+                urls.push(asset.browser_url.clone());
+            }
+            let installed = github::download_file(
+                &urls,
+                &file,
+                token.as_deref(),
+                &cancel,
+                |done, total| {
+                    let _ = tx.send(Msg::Progress { idx, done, total });
+                    ctx.request_repaint();
+                },
+            )
             .and_then(|_| {
                 let _ = tx.send(Msg::Installing { idx });
                 ctx.request_repaint();
-                install::install_asset(&file, asset.kind, &bundle)
+                install::install_asset(&file, asset.kind, &bundle, &install_dir, preserve_name)
             });
             let _ = std::fs::remove_file(&file);
-            let result = result.map(|_| install::installed_version(&bundle).unwrap_or_default());
-            let _ = tx.send(Msg::Done { idx, result });
+            let (actual_bundle, result) = match installed {
+                Ok(actual) => {
+                    let ver = install::installed_version(&actual, &install_dir).unwrap_or_default();
+                    (Some(actual), Ok(ver))
+                }
+                Err(e) => (None, Err(e)),
+            };
+            let _ = tx.send(Msg::Done {
+                idx,
+                bundle: actual_bundle,
+                result,
+            });
             ctx.request_repaint();
         });
     }
 
     /// Open the installed app.
     fn open_app(&mut self, idx: usize) {
-        match install::open_app(repos()[idx].bundle) {
+        let bundle = self.bundle_name(idx);
+        match install::open_app(&bundle, &self.settings.install_dir) {
             Ok(()) => self.state.status = format!("已打开 {}", repos()[idx].name),
             Err(e) => self.state.status = format!("打开失败: {e}"),
         }
@@ -742,6 +1020,8 @@ struct App {
     launcher: Launcher,
     /// The demo screen is set up once, not on every frame.
     demo_applied: bool,
+    /// Cached theme polarity so egui styles are only rebuilt when theme changes.
+    last_dark: Option<bool>,
 }
 
 impl eframe::App for App {
@@ -752,20 +1032,22 @@ impl eframe::App for App {
     /// whichever field has the keyboard; if none has it, the one field the
     /// open page shows is given the focus first.
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        // Esc closes the importer, the way it closes any panel.
-        if self.launcher.batch.is_some()
-            && raw_input.events.iter().any(|e| {
-                matches!(
-                    e,
-                    egui::Event::Key {
-                        key: egui::Key::Escape,
-                        pressed: true,
-                        ..
-                    }
-                )
-            })
-        {
+        // Esc closes any open modal or popover cleanly.
+        let esc_pressed = raw_input.events.iter().any(|e| {
+            matches!(
+                e,
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    pressed: true,
+                    ..
+                }
+            )
+        });
+        if esc_pressed {
             self.launcher.batch = None;
+            self.launcher.picker = None;
+            self.launcher.menu_for = None;
+            self.launcher.sort_open = false;
         }
 
         let already_pasted = raw_input
@@ -822,8 +1104,8 @@ impl eframe::App for App {
 
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        // The window's own backdrop, matching the page colour.
-        egui::Color32::from_rgb(0x12, 0x13, 0x16).to_normalized_gamma_f32()
+        // The window's own backdrop, matching the pure-black dark canvas.
+        egui::Color32::BLACK.to_normalized_gamma_f32()
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
@@ -843,7 +1125,13 @@ impl eframe::App for App {
         // changes, not every frame.
         let pointer = ctx.input(|i| i.pointer.hover_pos()).unwrap_or_default();
         let over_text = self.launcher.batch.is_some()
-            || (self.launcher.page == Page::Grid && self.launcher.search_rect.contains(pointer));
+            || (self.launcher.page == Page::Grid && self.launcher.search_rect.contains(pointer))
+            || (self.launcher.page == Page::Settings
+                && self
+                    .launcher
+                    .settings_text_rects
+                    .iter()
+                    .any(|r| r.contains(pointer)));
         if over_text != self.launcher.drag_blocked
             && set_movable_by_background(!over_text)
         {
@@ -852,7 +1140,8 @@ impl eframe::App for App {
         let dark = ctx.theme() == egui::Theme::Dark;
         let p = palette(dark);
 
-        {
+        if self.last_dark != Some(dark) {
+            self.last_dark = Some(dark);
             let theme = if dark {
                 egui::Theme::Dark
             } else {
@@ -1006,9 +1295,9 @@ impl Launcher {
         let bar = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.min.y + TOPBAR_H));
         ui.painter().rect_filled(bar, 0, p.bg);
         ui.painter()
-            .hline(bar.min.x..=bar.max.x - 0.5, 47.0, line(p.border));
+            .hline(bar.min.x..=bar.max.x - 0.5, TOPBAR_H, line(p.border));
 
-        let mid = 23.0;
+        let mid = TOPBAR_H * 0.5;
 
         // The bar is the window's handle: a double-click zooms it, the way
         // a title bar does. The buttons are drawn after this, so they sit
@@ -1027,23 +1316,18 @@ impl Launcher {
 
         match self.page {
             Page::Grid => {
-                // The wordmark, sitting clear of the traffic lights: the
-                // bird mark and the letters, drawn here rather than taken
-                // from anyone's artwork.
                 draw_g_mark(
                     ui.painter(),
-                    Rect::from_center_size(pos2(WORDMARK_X + 9.0, mid), vec2(18.0, 16.0)),
+                    Rect::from_center_size(pos2(WORDMARK_X + 8.0, mid), vec2(16.0, 14.0)),
                     p.text,
                 );
                 ui.painter().text(
-                    pos2(WORDMARK_X + 19.0, mid + 0.5),
+                    pos2(WORDMARK_X + 18.0, mid + 0.5),
                     Align2::LEFT_CENTER,
                     "ITUP LAUNCHER",
-                    display(24.0),
+                    display(20.0),
                     p.text,
                 );
-
-                // Nothing more on the left: the wordmark stands alone.
             }
             Page::Settings => {
                 ui.painter().text(
@@ -1056,8 +1340,6 @@ impl Launcher {
                 self.draw_close_button(ui, rect, mid, p);
             }
             Page::Detail(idx) => {
-                // The detail page's own header: a caption at the left, and
-                // the little navigation cluster at the right.
                 ui.painter().text(
                     pos2(WORDMARK_X, mid),
                     Align2::LEFT_CENTER,
@@ -1069,27 +1351,104 @@ impl Launcher {
             }
         }
 
-        // The bar itself carries nothing but the wordmark and the cog; the
-        // buttons that act on the subscriptions sit in the toolbar below.
+        // Self-update status pill on the Grid top bar when an update is available/ready.
+        if self.page == Page::Grid {
+            let pill_info: Option<(String, Color32, bool, u8)> = match &self.self_update {
+                self_update::SelfUpdateState::Ready { version, .. } => Some((
+                    format!("V{} 已就绪 · 重启更新", version.to_uppercase()),
+                    Color32::from_rgb(0x3D, 0xC9, 0x7A),
+                    true,
+                    2,
+                )),
+                self_update::SelfUpdateState::Available(rel) => Some((
+                    format!("发现新版 V{} · 更新", version::clean_tag(&rel.tag).to_uppercase()),
+                    p.amber,
+                    false,
+                    1,
+                )),
+                self_update::SelfUpdateState::Downloading { .. } => {
+                    let pct = self.self_update.progress_pct().unwrap_or(0);
+                    Some((format!("启动器更新中 {pct}%"), p.accent, false, 0))
+                }
+                self_update::SelfUpdateState::Staging => {
+                    Some(("正在准备更新…".to_string(), p.accent, false, 0))
+                }
+                _ => None,
+            };
+            if let Some((caption, accent_c, solid, action)) = pill_info {
+                let pw = measure(ui, &caption, label(11.0)) + 20.0;
+                let pill = Rect::from_min_max(
+                    pos2(rect.max.x - 56.0 - pw, mid - 12.0),
+                    pos2(rect.max.x - 56.0, mid + 12.0),
+                );
+                let hit = ui.interact(pill, ui.scope_id().with("topbar-self-upd"), Sense::click());
+                if hit.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if solid {
+                    ui.painter().rect_filled(pill, radius(12), accent_c);
+                } else {
+                    ui.painter().rect_filled(
+                        pill,
+                        radius(12),
+                        Color32::from_rgba_unmultiplied(
+                            accent_c.r(),
+                            accent_c.g(),
+                            accent_c.b(),
+                            if hit.hovered() { 42 } else { 24 },
+                        ),
+                    );
+                    ui.painter().rect_stroke(
+                        pill,
+                        radius(12),
+                        Stroke::new(1.0, accent_c),
+                        StrokeKind::Middle,
+                    );
+                }
+                ui.painter().text(
+                    pill.center(),
+                    Align2::CENTER_CENTER,
+                    &caption,
+                    label(11.0),
+                    if solid { p.bg } else { accent_c },
+                );
+                if hit.clicked() {
+                    match action {
+                        2 => self.apply_self_update_and_relaunch(),
+                        1 => self.start_self_update_download(),
+                        _ => self.page = Page::Settings,
+                    }
+                }
+            }
+        }
 
-        // A divider before the cog at the far right. It rides the right
-        // edge, wherever the window's edge now is.
-        let gear_x = rect.max.x - 30.0;
+        let gear_x = rect.max.x - 28.0;
         ui.painter()
-            .vline(rect.max.x - 48.0, 0.0..=47.0, line(p.border));
+            .vline(rect.max.x - 46.0, 0.0..=TOPBAR_H, line(p.border));
 
-        // The cog button, which opens the settings page.
         let gear_rect = Rect::from_center_size(pos2(gear_x, mid), vec2(22.0, 22.0));
         let resp = ui.interact(gear_rect, ui.scope_id().with("gear"), Sense::click());
         if resp.hovered() {
             ui.painter().rect_filled(gear_rect, radius(4), p.surface);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         if resp.clicked() {
             self.page = Page::Settings;
+            self.settings_scroll = 0.0;
             self.menu_for = None;
             self.sort_open = false;
         }
         gear_icon(ui.painter(), gear_rect, p.muted);
+        if matches!(
+            self.self_update,
+            self_update::SelfUpdateState::Available(_) | self_update::SelfUpdateState::Ready { .. }
+        ) {
+            ui.painter().circle_filled(
+                pos2(gear_rect.max.x - 2.0, gear_rect.min.y + 3.0),
+                3.5,
+                p.amber,
+            );
+        }
     }
 
     /// The detail page's navigation cluster: back, forward and close.
@@ -1185,18 +1544,17 @@ impl Launcher {
     // -------------------------------------------------------------- toolbar
 
     fn toolbar(&mut self, ui: &mut Ui, rect: Rect, p: &Palette) {
-        // Two captioned buttons at the far left, side by side and the same
-        // size: add a subscription, then ask GitHub about every repository
-        // again. Each carries its caption, so what it does is plain without
-        // having to hover it.
-        for (slot, id, caption, adds) in [
-            (0.0f32, "toolbar-add", "添加订阅", true),
-            (116.0, "check-updates", "刷新订阅", false),
+        let top = rect.min.y + 10.0;
+        let h = 30.0;
+        let bottom = top + h;
+
+        // Left action buttons: 添加订阅 + 刷新.
+        let mut left_x = MARGIN;
+        for (id, caption, w, adds) in [
+            ("toolbar-add", "添加订阅", 94.0f32, true),
+            ("check-updates", "刷新", 68.0f32, false),
         ] {
-            let btn = Rect::from_min_max(
-                pos2(MARGIN + slot, 66.0),
-                pos2(MARGIN + slot + 106.0, 99.0),
-            );
+            let btn = Rect::from_min_max(pos2(left_x, top), pos2(left_x + w, bottom));
             let resp = ui.interact(btn, ui.scope_id().with(id), Sense::click());
             let over = resp.hovered();
             if over {
@@ -1215,22 +1573,21 @@ impl Launcher {
             );
             let ink = if over { p.accent } else { p.muted };
             let mark = Rect::from_center_size(
-                pos2(btn.min.x + 20.0, btn.center().y),
-                vec2(14.0, 14.0),
+                pos2(btn.min.x + 17.0, btn.center().y),
+                vec2(13.0, 13.0),
             );
             if adds {
-                // A plus sign, drawn rather than typed: two hairlines.
                 ui.painter().line_segment(
                     [
-                        pos2(mark.center().x - 5.0, mark.center().y),
-                        pos2(mark.center().x + 5.0, mark.center().y),
+                        pos2(mark.center().x - 4.5, mark.center().y),
+                        pos2(mark.center().x + 4.5, mark.center().y),
                     ],
                     Stroke::new(1.4, ink),
                 );
                 ui.painter().line_segment(
                     [
-                        pos2(mark.center().x, mark.center().y - 5.0),
-                        pos2(mark.center().x, mark.center().y + 5.0),
+                        pos2(mark.center().x, mark.center().y - 4.5),
+                        pos2(mark.center().x, mark.center().y + 4.5),
                     ],
                     Stroke::new(1.4, ink),
                 );
@@ -1238,7 +1595,7 @@ impl Launcher {
                 refresh_icon(ui.painter(), mark, ink);
             }
             ui.painter().text(
-                pos2(btn.min.x + 34.0, btn.center().y),
+                pos2(btn.min.x + 30.0, btn.center().y),
                 Align2::LEFT_CENTER,
                 caption,
                 text(12.5),
@@ -1251,33 +1608,39 @@ impl Launcher {
                     self.spawn_meta_fetch_all();
                 }
             }
+            left_x += w + 8.0;
         }
 
-        // On the right: the view switch, then searching, then sorting. All
-        // of them hang off the right edge, so they stay put however wide
-        // the window is made.
+        // Right-anchored controls: view switch, search, sort.
         let right = rect.max.x - MARGIN;
 
-        // The view switch: two cells, the chosen one filled. The cells are
-        // a little wider than a bare tap target so the marks inside can be
-        // drawn large.
-        let toggle_w = 78.0;
-        let toggle_h = 33.0;
-        let toggle =
-            Rect::from_min_max(pos2(right - toggle_w, 66.0), pos2(right, 66.0 + toggle_h));
+        let toggle_w = 68.0;
+        let toggle = Rect::from_min_max(pos2(right - toggle_w, top), pos2(right, bottom));
         let grid_rect = Rect::from_min_max(toggle.min, pos2(toggle.center().x, toggle.max.y));
         let list_rect = Rect::from_min_max(pos2(toggle.center().x, toggle.min.y), toggle.max);
-        ui.painter().rect_filled(toggle, 0, p.bg);
+        ui.painter().rect_filled(toggle, radius(6), p.bg);
         let hot = match self.state.layout {
             View::Grid => grid_rect,
             View::List => list_rect,
         };
-        ui.painter().rect_filled(hot, 0, p.text);
-        ui.painter()
-            .rect_stroke(toggle, 0, line(p.border), StrokeKind::Middle);
+        ui.painter().rect_filled(hot, radius(5), p.text);
+        let resp = ui.interact(toggle, ui.scope_id().with("toggle"), Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        ui.painter().rect_stroke(
+            toggle,
+            radius(6),
+            if resp.hovered() {
+                Stroke::new(1.2, p.accent)
+            } else {
+                line(p.border)
+            },
+            StrokeKind::Middle,
+        );
         grid_icon(
             ui.painter(),
-            Rect::from_center_size(grid_rect.center(), vec2(19.0, 19.0)),
+            Rect::from_center_size(grid_rect.center(), vec2(16.0, 16.0)),
             if self.state.layout == View::Grid {
                 p.bg
             } else {
@@ -1286,14 +1649,13 @@ impl Launcher {
         );
         list_icon(
             ui.painter(),
-            Rect::from_center_size(list_rect.center(), vec2(19.0, 19.0)),
+            Rect::from_center_size(list_rect.center(), vec2(16.0, 16.0)),
             if self.state.layout == View::List {
                 p.bg
             } else {
                 p.muted
             },
         );
-        let resp = ui.interact(toggle, ui.scope_id().with("toggle"), Sense::click());
         if resp.clicked() {
             self.state.layout = match self.state.layout {
                 View::Grid => View::List,
@@ -1301,92 +1663,208 @@ impl Launcher {
             };
         }
 
-        // The search box, a hand's width left of the toggle.
-        let search_w = 206.0;
-        let search_h = 33.0;
+        // Search box with focus accent and clear button.
+        let search_w = 196.0;
         let search_rect = Rect::from_min_max(
-            pos2(toggle.min.x - 6.0 - search_w, 66.0),
-            pos2(toggle.min.x - 6.0, 66.0 + search_h),
+            pos2(toggle.min.x - 8.0 - search_w, top),
+            pos2(toggle.min.x - 8.0, bottom),
         );
-        // Remembered, so the window-drag switch knows when the pointer is
-        // over this field.
         self.search_rect = search_rect;
-        // The picture's box is filled near-black inside its border.
-        ui.painter()
-            .rect_filled(search_rect, 0, p.search_fill);
-        ui.painter()
-            .rect_stroke(search_rect, 0, line(p.border), StrokeKind::Middle);
-        // The hint sits at the left edge, on the box's middle line: the
-        // field's own hint would do the same, but drawing it keeps the
-        // spacing exact.
+        let search_id = egui::Id::unique("toolbar-search");
+        let search_focused = ui.memory(|m| m.has_focus(search_id));
+        ui.painter().rect_filled(search_rect, radius(6), p.search_fill);
+        ui.painter().rect_stroke(
+            search_rect,
+            radius(6),
+            if search_focused {
+                Stroke::new(1.5, p.accent)
+            } else {
+                line(p.border)
+            },
+            StrokeKind::Middle,
+        );
         if self.search.is_empty() {
             ui.painter().text(
-                pos2(search_rect.min.x + 12.0, search_rect.center().y),
+                pos2(search_rect.min.x + 10.0, search_rect.center().y),
                 Align2::LEFT_CENTER,
-                "搜索应用",
-                text(13.0),
-                p.muted,
+                "搜索应用…",
+                text(12.5),
+                p.faint,
             );
         }
+        let clear_space = if self.search.is_empty() { 8.0 } else { 24.0 };
         let edit = TextEdit::singleline(&mut self.search)
-            .id(egui::Id::unique("toolbar-search"))
+            .id(search_id)
             .text_color(p.text)
             .frame(egui::Frame::NONE)
-            .desired_width(search_rect.width() - 16.0);
-        // The box is drawn by hand, so the real field sits on top of it,
-        // riding the box's middle line.
+            .desired_width(search_rect.width() - 10.0 - clear_space);
         let mut child = ui.new_child(
             egui::UiBuilder::new().max_rect(Rect::from_min_max(
-                pos2(search_rect.min.x + 8.0, search_rect.center().y - 9.5),
-                pos2(search_rect.max.x - 8.0, search_rect.center().y + 9.5),
+                pos2(search_rect.min.x + 8.0, search_rect.center().y - 9.0),
+                pos2(search_rect.max.x - clear_space, search_rect.center().y + 9.0),
             )),
         );
         child.add(edit);
+        if !self.search.is_empty() {
+            let clr = Rect::from_center_size(
+                pos2(search_rect.max.x - 13.0, search_rect.center().y),
+                vec2(16.0, 16.0),
+            );
+            let clr_hit = ui.interact(clr, ui.scope_id().with("search-clear"), Sense::click());
+            if clr_hit.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            let st = Stroke::new(1.3, if clr_hit.hovered() { p.text } else { p.muted });
+            let c = clr.center();
+            ui.painter()
+                .line_segment([pos2(c.x - 3.5, c.y - 3.5), pos2(c.x + 3.5, c.y + 3.5)], st);
+            ui.painter()
+                .line_segment([pos2(c.x + 3.5, c.y - 3.5), pos2(c.x - 3.5, c.y + 3.5)], st);
+            if clr_hit.clicked() {
+                self.search.clear();
+                self.state.scroll = 0.0;
+            }
+        }
 
-        // The sort control: a label and a bordered box, left of the search.
-        let sort_w = 190.0;
+        // Sort dropdown trigger.
+        let sort_w = 132.0;
         let sort_rect = Rect::from_min_max(
-            pos2(search_rect.min.x - 8.0 - sort_w, 66.0),
-            pos2(search_rect.min.x - 8.0, 66.0 + search_h),
+            pos2(search_rect.min.x - 8.0 - sort_w, top),
+            pos2(search_rect.min.x - 8.0, bottom),
         );
-        ui.painter()
-            .rect_stroke(sort_rect, 0, line(p.border), StrokeKind::Middle);
+        let resp_sort = ui.interact(sort_rect, ui.scope_id().with("sort"), Sense::click());
+        if resp_sort.hovered() {
+            ui.painter().rect_filled(sort_rect, radius(6), p.surface);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        ui.painter().rect_stroke(
+            sort_rect,
+            radius(6),
+            if resp_sort.hovered() || self.sort_open {
+                Stroke::new(1.2, p.accent)
+            } else {
+                line(p.border)
+            },
+            StrokeKind::Middle,
+        );
         let sort_name = match self.state.sort {
             SortBy::Name => "名称 (A-Z)",
             SortBy::Updated => "最后更新",
         };
         ui.painter().text(
-            pos2(sort_rect.min.x + 12.0, sort_rect.center().y),
+            pos2(sort_rect.min.x + 10.0, sort_rect.center().y),
             Align2::LEFT_CENTER,
             sort_name,
-            text(14.0),
+            text(12.5),
             p.text,
         );
         caret_down(
             ui.painter(),
             Rect::from_center_size(
-                pos2(sort_rect.max.x - 17.0, sort_rect.center().y),
-                vec2(11.0, 11.0),
+                pos2(sort_rect.max.x - 14.0, sort_rect.center().y),
+                vec2(9.0, 9.0),
             ),
-            p.text,
+            p.muted,
         );
-        let resp_sort = ui.interact(sort_rect, ui.scope_id().with("sort"), Sense::click());
         if resp_sort.clicked() {
             self.sort_open = !self.sort_open;
             self.menu_for = None;
         }
 
-        // The "排序" label, just left of the box.
-        ui.painter().text(
-            pos2(sort_rect.min.x - 4.5, sort_rect.center().y + 0.5),
-            Align2::RIGHT_CENTER,
-            "排序",
-            text(13.0),
-            p.faint,
-        );
+        // Compact segmented status filter pills in the middle when there is room.
+        let total_sub = (0..repos().len())
+            .filter(|&i| self.state.subscribed[i])
+            .count();
+        let total_inst = (0..repos().len())
+            .filter(|&i| self.state.subscribed[i] && self.state.is_installed(i))
+            .count();
+        let total_upd = (0..repos().len())
+            .filter(|&i| self.state.subscribed[i] && self.state.has_update(i))
+            .count();
 
-        // The dropdown is drawn last, on top of the cards, so only its
-        // position is recorded here.
+        let pills = [
+            (Filter::All, format!("全部 {total_sub}"), false),
+            (Filter::Installed, format!("已安装 {total_inst}"), false),
+            (
+                Filter::Updatable,
+                if total_upd > 0 {
+                    format!("可更新 {total_upd}")
+                } else {
+                    "可更新".to_string()
+                },
+                total_upd > 0,
+            ),
+        ];
+        let pill_widths: Vec<f32> = pills
+            .iter()
+            .map(|(_, label_s, _)| measure(ui, label_s, text(12.0)) + 20.0)
+            .collect();
+        let group_w: f32 = pill_widths.iter().sum::<f32>();
+        let group_x = left_x + 8.0;
+        if group_x + group_w + 16.0 < sort_rect.min.x {
+            let group_rect = Rect::from_min_max(pos2(group_x, top), pos2(group_x + group_w, bottom));
+            ui.painter().rect_filled(group_rect, radius(6), p.search_fill);
+            ui.painter()
+                .rect_stroke(group_rect, radius(6), line(p.border), StrokeKind::Middle);
+            let mut px = group_x;
+            for ((kind, caption, highlight), pw) in pills.iter().zip(pill_widths.iter()) {
+                let cell = Rect::from_min_max(pos2(px, top), pos2(px + *pw, bottom));
+                let active = self.filter == *kind;
+                let hit = ui.interact(cell, ui.scope_id().with(("filter", *kind as u8)), Sense::click());
+                if hit.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if active {
+                    let fill = if *kind == Filter::Updatable && *highlight {
+                        p.amber
+                    } else {
+                        p.text
+                    };
+                    ui.painter().rect_filled(cell.shrink(1.5), radius(4), fill);
+                } else if hit.hovered() {
+                    ui.painter().rect_filled(cell.shrink(1.5), radius(4), p.surface);
+                }
+                let fg = if active {
+                    p.bg
+                } else if *highlight {
+                    p.amber
+                } else if hit.hovered() {
+                    p.text
+                } else {
+                    p.muted
+                };
+                ui.painter()
+                    .text(cell.center(), Align2::CENTER_CENTER, caption, text(12.0), fg);
+                if hit.clicked() {
+                    self.filter = *kind;
+                    self.state.scroll = 0.0;
+                }
+                px += *pw;
+            }
+            // One-click "全部更新" button when updates are available and space permits.
+            if total_upd > 0 {
+                let upd_x = group_x + group_w + 8.0;
+                let upd_w = 76.0;
+                if upd_x + upd_w + 12.0 < sort_rect.min.x {
+                    let upd_rect =
+                        Rect::from_min_max(pos2(upd_x, top), pos2(upd_x + upd_w, bottom));
+                    let painter = ui.painter().clone();
+                    if primary_button(
+                        ui,
+                        &painter,
+                        upd_rect,
+                        ui.scope_id().with("update-all"),
+                        "全部更新",
+                        12.0,
+                        rect,
+                        p,
+                    ) {
+                        self.update_all();
+                    }
+                }
+            }
+        }
+
         if self.sort_open {
             self.pending_sort = Some(sort_rect);
         }
@@ -1426,20 +1904,49 @@ impl Launcher {
         let apps = self.visible();
 
         if apps.is_empty() {
+            let empty_msg = if self.filter == Filter::Updatable {
+                "所有已安装应用均为最新版本"
+            } else {
+                "没有找到匹配的应用"
+            };
             ui.painter().text(
-                pos2(rect.center().x, grid_top + 60.0),
+                pos2(rect.center().x, grid_top + 64.0),
                 Align2::CENTER_CENTER,
-                "没有找到应用",
+                empty_msg,
                 text(14.0),
                 p.muted,
             );
+            if self.filter != Filter::All || !self.search.is_empty() {
+                let reset_rect = Rect::from_center_size(
+                    pos2(rect.center().x, grid_top + 100.0),
+                    vec2(104.0, 28.0),
+                );
+                let painter = ui.painter().clone();
+                if action_button(
+                    ui,
+                    &painter,
+                    reset_rect,
+                    egui::Id::unique("empty-reset"),
+                    "查看全部",
+                    12.5,
+                    band,
+                    p,
+                ) {
+                    self.filter = Filter::All;
+                    self.search.clear();
+                    self.state.scroll = 0.0;
+                }
+            }
             return;
         }
 
+        let avail_w = (band.width() - MARGIN - RIGHT_GUTTER).max(200.0);
+        let cols = grid_columns(avail_w);
+
         // How tall the whole thing is, before the window clips it.
         let content_h = match self.state.layout {
-            View::Grid => self.grid_height(&apps),
-            View::List => 44.0 + apps.len() as f32 * 70.0,
+            View::Grid => self.grid_height(&apps, cols),
+            View::List => self.list_height(&apps),
         };
 
         // A repository that has just been added sits at the end of the
@@ -1464,7 +1971,7 @@ impl Launcher {
 
     /// The wheel moves the content in the same direction the Mac's own
     /// scrollbars move.
-    fn apply_wheel(&self, ui: &Ui, band: Rect, content_h: f32, scroll: f32) -> f32 {
+    pub(crate) fn apply_wheel(&self, ui: &Ui, band: Rect, content_h: f32, scroll: f32) -> f32 {
         let max_scroll = (content_h - band.height()).max(0.0);
         if max_scroll <= 0.0 {
             return 0.0;
@@ -1483,7 +1990,7 @@ impl Launcher {
     /// The scrollbar down the right of the content. The track is the same
     /// two-pixel grey strip the picture shows; the thumb in it can be
     /// dragged, and clicking the track pages up or down.
-    fn scrollbar(
+    pub(crate) fn scrollbar(
         &self,
         ui: &mut Ui,
         band: Rect,
@@ -1542,12 +2049,12 @@ impl Launcher {
     /// way the original draws it. The columns share whatever width the
     /// window has, and the whole thing rides the scroll offset.
     fn grid(&mut self, ui: &mut Ui, band: Rect, apps: &[usize], p: &Palette) {
-        let col_w = (band.width() - MARGIN - RIGHT_GUTTER) / COLUMNS as f32;
+        let avail_w = (band.width() - MARGIN - RIGHT_GUTTER).max(200.0);
+        let cols = grid_columns(avail_w);
+        let col_w = (avail_w - CARD_GAP * (cols.saturating_sub(1)) as f32) / cols as f32;
         let scroll = self.state.scroll;
         let pointer = ui.input(|i| i.pointer.hover_pos());
-        // What is on this Mac comes first; everything else is gathered
-        // under one 未安装 heading and drawn quietly, until the pointer
-        // arrives and gives it its colour back.
+        // Installed apps come first; uninstalled ones sit below a compact 未安装 heading.
         let installed: Vec<usize> = apps
             .iter()
             .copied()
@@ -1560,80 +2067,67 @@ impl Launcher {
             .collect();
 
         let mut top = band.min.y - scroll;
-        let mut first_row = true;
         for (group, dim) in [(&installed, false), (&missing, true)] {
             if group.is_empty() {
                 continue;
             }
             if dim {
-                let head = Rect::from_min_size(
-                    pos2(MARGIN, top),
-                    vec2(band.width() - MARGIN - RIGHT_GUTTER, SECTION_H),
-                );
+                let head = Rect::from_min_size(pos2(MARGIN, top), vec2(avail_w, SECTION_H));
                 if head.intersects(band) {
+                    let heading = format!("未安装 · {}", group.len());
                     ui.painter().text(
                         pos2(head.min.x + 2.0, head.center().y),
                         Align2::LEFT_CENTER,
-                        "未安装",
-                        label(12.0),
+                        &heading,
+                        label(11.5),
                         p.faint,
                     );
+                    let hw = measure(ui, &heading, label(11.5));
                     ui.painter().hline(
-                        head.min.x..=head.max.x,
-                        head.max.y - 1.0,
+                        (head.min.x + hw + 12.0)..=head.max.x,
+                        head.center().y,
                         line(p.border),
                     );
                 }
                 top += SECTION_H;
             }
-            for chunk in group.chunks(COLUMNS) {
-                let row_h = if first_row { 313.0 } else { 289.0 };
-                first_row = false;
+            for chunk in group.chunks(cols) {
                 for (col, &idx) in chunk.iter().enumerate() {
-                    let x = MARGIN + col as f32 * col_w;
-                    // The last column stops short of the scrollbar.
-                    let w = if col == COLUMNS - 1 {
-                        col_w - 2.5
-                    } else {
-                        col_w
-                    };
-                    let card = Rect::from_min_size(pos2(x, top), vec2(w, row_h));
+                    let x = MARGIN + col as f32 * (col_w + CARD_GAP);
+                    let card = Rect::from_min_size(pos2(x, top), vec2(col_w, CARD_H));
                     self.card(ui, card, idx, band, p);
                     if dim {
-                        let over = pointer
-                            .map(|pos| card.contains(pos))
-                            .unwrap_or(false);
+                        let over = pointer.map(|pos| card.contains(pos)).unwrap_or(false);
                         if !over {
                             let vis = card.intersect(band);
                             if vis.is_positive() {
                                 ui.painter().rect_filled(
                                     vis,
-                                    0,
+                                    radius(8),
                                     Color32::from_rgba_unmultiplied(
                                         p.bg.r(),
                                         p.bg.g(),
                                         p.bg.b(),
-                                        165,
+                                        120,
                                     ),
                                 );
                             }
                         }
                     }
                 }
-                top += row_h;
+                top += CARD_H + CARD_GAP;
             }
         }
     }
 
     /// How tall the grid content is, for the scrollbar and the wheel.
-    fn grid_height(&self, apps: &[usize]) -> f32 {
+    fn grid_height(&self, apps: &[usize], cols: usize) -> f32 {
         let installed = apps
             .iter()
             .filter(|&&i| self.state.is_installed(i))
             .count();
         let missing = apps.len() - installed;
         let mut h = 0.0;
-        let mut first_row = true;
         for (count, is_missing) in [(installed, false), (missing, true)] {
             if count == 0 {
                 continue;
@@ -1641,40 +2135,25 @@ impl Launcher {
             if is_missing {
                 h += SECTION_H;
             }
-            for _ in 0..count.div_ceil(COLUMNS) {
-                h += if first_row { 313.0 } else { 289.0 };
-                first_row = false;
-            }
+            let rows = count.div_ceil(cols.max(1));
+            h += rows as f32 * (CARD_H + CARD_GAP);
         }
         h
     }
 
-    /// One app card: a header line, the app itself, then the action button.
-    /// Anything outside the visible strip is neither drawn nor clickable,
-    /// so a card scrolled away cannot be pressed through the footer.
+    /// Compact app card: icon + title/version/owner + 2-line summary + date + action bar.
     fn card(&mut self, ui: &mut Ui, card: Rect, idx: usize, band: Rect, p: &Palette) {
         let vis = card.intersect(band);
         if !vis.is_positive() {
             return;
         }
-        // Everything inside a card is clipped to the card's own column —
-        // and to the visible strip — so a long line never runs into the
-        // next card, nor off the top of the window.
         let clip = ui.painter().with_clip_rect(vis);
         let painter = &clip;
 
         let app = &repos()[idx];
-        // The whole card is one click target: anywhere inside it opens the
-        // app's page. The small links and buttons inside are registered
-        // after it, so they still win the click where they sit. While the
-        // pointer is over the card its frame takes the accent colour.
         let mut hovered = false;
         if vis.is_positive() {
-            let resp = ui.interact(
-                vis,
-                ui.scope_id().with(("card", app.id)),
-                Sense::click(),
-            );
+            let resp = ui.interact(vis, ui.scope_id().with(("card", app.id)), Sense::click());
             hovered = resp.hovered() || self.hover_demo == Some(idx);
             if hovered {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1683,13 +2162,9 @@ impl Launcher {
                 self.open_page(idx);
             }
         }
-        // Everything read off the state is copied out up front, so the
-        // borrows are done before anything calls back into it.
         let installed = self.state.is_installed(idx);
         let has_update = self.state.has_update(idx);
-        let (phase, progress) = self
-            .state
-            .repos[idx]
+        let (phase, progress) = self.state.repos[idx]
             .job
             .as_ref()
             .map(|j| (j.phase, j.progress))
@@ -1701,50 +2176,42 @@ impl Launcher {
                 format!("V{}", version::clean_tag(&rel.tag).to_uppercase()),
                 version::fmt_date(&rel.published),
             ),
-            // Nothing came back: say what is on this Mac rather than
-            // leaving the card blank.
             FetchState::Done(Err(_)) => match &self.state.repos[idx].installed {
                 Some(v) => (format!("V{}", v.to_uppercase()), "未获取到".to_string()),
                 None => ("—".to_string(), "未获取到".to_string()),
             },
         };
 
-        // The card's frame. On hover it is tinted and outlined in the
-        // accent colour, so the pointer's target is obvious.
-        if hovered {
-            painter.rect_filled(card, 0, p.surface);
-            painter.rect_stroke(
-                card,
-                0,
-                Stroke::new(1.5, p.accent),
-                StrokeKind::Middle,
-            );
+        // Subtle elevated surface so separated cards read crisply in both dark & light themes.
+        let dark = p.bg.r() < 128;
+        let card_bg = if hovered {
+            if dark {
+                Color32::from_rgb(0x16, 0x18, 0x1D)
+            } else {
+                Color32::from_rgb(0xF3, 0xF6, 0xFB)
+            }
+        } else if dark {
+            Color32::from_rgb(0x0C, 0x0D, 0x0F)
         } else {
-            painter.rect_stroke(card, 0, line(p.border), StrokeKind::Middle);
-        }
-
-        // The header strip: the version on the left, a link on the right.
-        let header = Rect::from_min_max(card.min, pos2(card.max.x, card.min.y + CARD_HEAD_H));
-        painter.hline(header.min.x..=header.max.x, header.max.y, line(p.border));
-        let version_color = if has_update {
-            p.amber
-        } else {
-            Color32::from_rgb(app.bright.0, app.bright.1, app.bright.2)
+            Color32::WHITE
         };
-        painter.text(
-            pos2(header.min.x + 20.0, header.center().y + 1.5),
-            Align2::LEFT_CENTER,
-            &version_text,
-            label(12.0),
-            version_color,
+        let border_stroke = if hovered {
+            Stroke::new(1.5, p.accent)
+        } else if has_update {
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(p.amber.r(), p.amber.g(), p.amber.b(), 140))
+        } else {
+            line(p.border)
+        };
+        painter.rect_filled(card, radius(8), card_bg);
+        painter.rect_stroke(card, radius(8), border_stroke, StrokeKind::Middle);
+
+        let pad = 14.0;
+        // Top-right external GitHub link button.
+        let link_rect = Rect::from_min_size(
+            pos2(card.max.x - pad - 24.0, card.min.y + 12.0),
+            vec2(24.0, 24.0),
         );
-        // The little link, top right. The picture puts it at 297..360 pt.
-        let link_x = header.max.x - 82.0;
-        let link_hit = Rect::from_min_max(
-            pos2(link_x - 6.0, header.min.y),
-            pos2(header.max.x - 14.0, header.max.y),
-        )
-        .intersect(band);
+        let link_hit = link_rect.intersect(band);
         let mut link_hover = false;
         if link_hit.is_positive() {
             let resp = ui.interact(
@@ -1753,30 +2220,22 @@ impl Launcher {
                 Sense::click(),
             );
             link_hover = resp.hovered();
+            if link_hover {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                painter.rect_filled(link_rect, radius(5), p.surface);
+            }
             if resp.clicked() {
                 self.open_repo_page(idx);
             }
         }
-        painter.text(
-            pos2(link_x, header.center().y),
-            Align2::LEFT_CENTER,
-            "GITHUB",
-            label(12.0),
-            if link_hover { p.accent } else { p.muted },
-        );
         arrow_out(
             painter,
-            Rect::from_center_size(pos2(link_x + 72.0, header.center().y), vec2(12.0, 12.0)),
-            p.muted,
+            Rect::from_center_size(link_rect.center(), vec2(12.0, 12.0)),
+            if link_hover { p.accent } else { p.faint },
         );
 
-        // The app's tile, then the name and the badge. The picture puts the
-        // tile at 40..96 pt across and 182..238 pt down. Clicking the tile
-        // opens the app's own page.
-        let tile = Rect::from_min_size(
-            pos2(card.min.x + 20.0, header.max.y + 19.0),
-            vec2(TILE, TILE),
-        );
+        // App icon tile.
+        let tile = Rect::from_min_size(pos2(card.min.x + pad, card.min.y + pad), vec2(TILE, TILE));
         let tile_hit = tile.intersect(band);
         if tile_hit.is_positive() {
             let resp = ui.interact(
@@ -1790,86 +2249,99 @@ impl Launcher {
         }
         self.draw_tile(painter, tile, idx, 10);
 
-        let text_x = tile.max.x + 15.0;
-        let name_y = tile.min.y + 19.0;
-        // The name, plain white as asked for.
-        let name_w = measure(ui, app.name, display(22.0));
+        // App name + version & owner meta line beside the icon.
+        let text_x = tile.max.x + 12.0;
+        let title_max_w = (link_rect.min.x - 8.0 - text_x).max(40.0);
+        let shown_name = fit_text(ui, app.name, display(17.5), title_max_w);
         painter.text(
-            pos2(text_x, name_y),
+            pos2(text_x, tile.min.y + 12.0),
             Align2::LEFT_CENTER,
-            app.name,
-            display(22.0),
+            shown_name,
+            display(17.5),
             p.text,
         );
 
-        // The badge that says who publishes it. A long owner name would
-        // run past the card's rule, so it is shortened, then dropped, when
-        // there is no room beside the app's name.
+        let version_color = if has_update {
+            p.amber
+        } else {
+            Color32::from_rgb(app.bright.0, app.bright.1, app.bright.2)
+        };
+        let meta_y = tile.min.y + 34.0;
+        painter.text(
+            pos2(text_x, meta_y),
+            Align2::LEFT_CENTER,
+            &version_text,
+            label(11.5),
+            version_color,
+        );
+        let ver_w = measure(ui, &version_text, label(11.5));
         let owner = catalog::owner_of(app.slug).to_uppercase();
-        let badge_x = text_x + name_w + 14.0;
-        let room = card.max.x - 16.0 - badge_x;
-        for (word, size) in [
-            (format!("由 {owner} 提供"), 11.0),
-            (format!("由 {owner}"), 10.0),
-        ] {
-            let badge_w = measure(ui, &word, label(size)) + 22.0;
-            if badge_w <= room {
-                let badge = Rect::from_min_size(
-                    pos2(badge_x, name_y - 11.0),
-                    vec2(badge_w, 22.0),
-                );
-                painter.rect_stroke(badge, 0, line(p.border), StrokeKind::Middle);
-                painter.text(
-                    pos2(badge.center().x, badge.center().y),
-                    Align2::CENTER_CENTER,
-                    &word,
-                    label(size),
-                    p.accent,
-                );
-                break;
-            }
+        let owner_x = text_x + ver_w + 6.0;
+        let owner_room = (card.max.x - pad - owner_x).max(0.0);
+        if owner_room > 24.0 {
+            let owner_str = fit_text(ui, &format!("· {owner}"), label(11.0), owner_room);
+            painter.text(
+                pos2(owner_x, meta_y),
+                Align2::LEFT_CENTER,
+                owner_str,
+                label(11.0),
+                p.faint,
+            );
         }
 
-        // The Chinese one-liner, under the name.
-        painter.text(
-            pos2(text_x, name_y + 23.0),
-            Align2::LEFT_CENTER,
-            app.tagline,
-            text(14.0),
-            p.muted,
-        );
-
-        // The English description, on the left below the tile.
-        let desc_y = header.max.y + TILE + 46.0;
-        // Text starts twenty points in and stops twenty short, so no line
-        // ever runs into the card's rule.
-        let wrap_w = card.width() - 40.0;
+        // 2-line clamped description with comfortable breathing room (cached).
+        let desc_y = tile.max.y + 12.0;
+        let wrap_w = (card.width() - pad * 2.0).max(40.0);
         let summary = self.summary_text(idx);
-        let galley = painter.layout(summary, text(14.0), p.muted, wrap_w);
-        let galley_h = galley.size().y;
-        painter.galley(pos2(card.min.x + 20.0, desc_y - 7.0), galley, p.muted);
+        let cache_key = (app.slug.to_string(), wrap_w.round() as u32, summary.len());
+        let clamped = if let Some(cached) = self.clamp_cache.get(&cache_key) {
+            cached.clone()
+        } else {
+            let computed = clamp_two_lines(ui, &summary, text(13.0), wrap_w);
+            self.clamp_cache.insert(cache_key, computed.clone());
+            computed
+        };
+        let galley = painter.layout(clamped, text(13.0), p.muted, wrap_w);
+        painter.galley(pos2(card.min.x + pad, desc_y), galley, p.muted);
 
-        // The date of the newest release, below the description.
+        // Action bar anchored at bottom, with date & status row directly above it.
+        let btn_h = 30.0;
+        let btn_y = card.max.y - pad - btn_h;
+        let meta_row_y = btn_y - 16.0;
+
         painter.text(
-            pos2(card.min.x + 20.0, desc_y + galley_h - 7.0 + 18.0),
+            pos2(card.min.x + pad, meta_row_y),
             Align2::LEFT_CENTER,
-            format!("最后更新: {date_text}"),
-            text(13.0),
+            format!("更新于 {date_text}"),
+            text(12.0),
             p.faint,
         );
+        if has_update {
+            let badge_w = measure(ui, "可更新", label(10.5)) + 14.0;
+            let badge = Rect::from_min_max(
+                pos2(card.max.x - pad - badge_w, meta_row_y - 9.5),
+                pos2(card.max.x - pad, meta_row_y + 9.5),
+            );
+            painter.rect_filled(
+                badge,
+                radius(9),
+                Color32::from_rgba_unmultiplied(p.amber.r(), p.amber.g(), p.amber.b(), 28),
+            );
+            painter.rect_stroke(badge, radius(9), Stroke::new(1.0, p.amber), StrokeKind::Middle);
+            painter.text(badge.center(), Align2::CENTER_CENTER, "可更新", label(10.5), p.amber);
+        } else if !installed {
+            painter.text(
+                pos2(card.max.x - pad, meta_row_y),
+                Align2::RIGHT_CENTER,
+                "未安装",
+                label(10.5),
+                p.faint,
+            );
+        }
 
-        // The action button, and the small menu beside it. The picture
-        // puts them at 40..363 pt and 383..363 pt across. The row sits a
-        // fixed distance above the card's own bottom edge, so it can
-        // never spill onto the next card's frame. An app with an update
-        // waiting gets a second, narrow 打开 button at the left, so the
-        // copy on this Mac can still be started while the new one
-        // downloads.
-        let btn_h = 33.0;
-        let btn_y = card.max.y - 53.0;
-        let more_w = 37.0;
-        let right_edge = card.max.x - 18.0;
-        let left_edge = card.min.x + 20.0;
+        let more_w = 32.0;
+        let right_edge = card.max.x - pad;
+        let left_edge = card.min.x + pad;
         let more_rect = Rect::from_min_max(
             pos2(right_edge - more_w, btn_y),
             pos2(right_edge, btn_y + btn_h),
@@ -1879,8 +2351,6 @@ impl Launcher {
             pos2(more_rect.min.x - 8.0, btn_y + btn_h),
         );
 
-        // An app with an update waiting gets 打开 and 更新 side by side,
-        // each exactly half the row.
         let show_open = !busy && has_update && installed;
         let half = (main_rect.width() - 8.0) / 2.0;
         let mut main_left = main_rect.min.x;
@@ -1895,7 +2365,7 @@ impl Launcher {
                 launch,
                 egui::Id::unique(("launch", app.id)),
                 "打开",
-                15.0,
+                13.5,
                 band,
                 p,
             ) {
@@ -1917,7 +2387,7 @@ impl Launcher {
                 open_rect,
                 egui::Id::unique(("open", app.id)),
                 &label_text,
-                15.0,
+                13.5,
                 band,
                 p,
             )
@@ -1928,7 +2398,7 @@ impl Launcher {
                 open_rect,
                 egui::Id::unique(("open", app.id)),
                 &label_text,
-                15.0,
+                13.5,
                 band,
                 p,
             )
@@ -1937,7 +2407,6 @@ impl Launcher {
             self.act(idx);
         }
         if busy && phase == JobPhase::Downloading && progress > 0.0 {
-            // Fill the button in step with the real download.
             let filled = Rect::from_min_max(
                 open_rect.min,
                 pos2(
@@ -1945,13 +2414,13 @@ impl Launcher {
                     open_rect.max.y,
                 ),
             );
-            painter.rect_filled(filled, 0, p.surface);
-            painter.rect_stroke(open_rect, 0, line(p.border), StrokeKind::Middle);
+            painter.rect_filled(filled, radius(5), p.surface);
+            painter.rect_stroke(open_rect, radius(5), line(p.border), StrokeKind::Middle);
             painter.text(
-                pos2(open_rect.center().x, open_rect.center().y),
+                open_rect.center(),
                 Align2::CENTER_CENTER,
                 label_text,
-                text(15.0),
+                text(13.5),
                 p.text,
             );
         }
@@ -1974,126 +2443,14 @@ impl Launcher {
             self.sort_open = false;
         }
 
-        // The little menu that opens beside the button is drawn last, on
-        // top of the cards.
         if self.menu_for == Some(idx) {
             self.pending_menu = Some((more_rect, idx));
         }
     }
 
-    /// The small menu beside a card's button, drawn on top of the cards.
-    fn draw_menu(&mut self, ui: &mut Ui, anchor: Rect, idx: usize, body: Rect, p: &Palette) {
-        let painter = ui.painter();
-        let app = &repos()[idx];
-        let installed = self.state.is_installed(idx);
-        // Grouped the way the reference menu is: what to do with the app,
-        // where to read about it, then the two ways to be rid of it. An
-        // empty label is a rule between groups.
-        // The menu the picture asks for: where to read about the app, in
-        // the order it was given, then the two ways to be rid of it.
-        let mut items: Vec<(&'static str, &'static str)> = Vec::new();
-        items.push(("GitHub 仓库", "repo"));
-        items.push(("更新说明", "notes"));
-        items.push(("所有版本", "all"));
-        items.push(("选择版本", "versions"));
-        items.push(("", "sep"));
-        if installed {
-            items.push(("卸载软件", "uninstall"));
-        }
-        items.push(("删除订阅", "unsub"));
-
-        let w = 168.0;
-        let row_h = 34.0;
-        let sep_h = 15.0;
-        let h: f32 = items
-            .iter()
-            .map(|(label, _)| if label.is_empty() { sep_h } else { row_h })
-            .sum();
-        // Below the button when there is room, above it when there is not.
-        let below = anchor.max.y + 4.0 + h;
-        let top = if below > body.max.y {
-            anchor.min.y - 4.0 - h
-        } else {
-            anchor.max.y + 4.0
-        };
-        let left = if anchor.min.x + w > body.max.x - MARGIN {
-            anchor.max.x - w
-        } else {
-            anchor.min.x
-        };
-        let rect = Rect::from_min_max(pos2(left, top), pos2(left + w, top + h));
-        // The pop-up closes itself once the pointer has left it — the small
-        // button that opened it still counts as being on it.
-        if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
-            if !rect.contains(pointer) && !anchor.expand(8.0).contains(pointer) {
-                self.menu_for = None;
-                return;
-            }
-        }
-        painter.rect_filled(rect, 0, p.surface);
-        painter.rect_stroke(rect, 0, line(p.border), StrokeKind::Middle);
-
-        let mut y = rect.min.y;
-        for (i, (label, action)) in items.iter().enumerate() {
-            if label.is_empty() {
-                painter.hline(
-                    (rect.min.x + 10.0)..=(rect.max.x - 10.0),
-                    y + sep_h * 0.5,
-                    line(p.border),
-                );
-                y += sep_h;
-                continue;
-            }
-            let row = Rect::from_min_max(
-                pos2(rect.min.x, y),
-                pos2(rect.max.x, y + row_h),
-            );
-            let resp = ui.interact(
-                row,
-                egui::Id::unique(("menu", app.id, i)),
-                Sense::click(),
-            );
-            if resp.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if resp.clicked() {
-                match *action {
-                    "versions" => self.open_versions(idx),
-                    "notes" => self.open_notes(idx),
-                    "repo" => {
-                        let url = format!("https://github.com/{}", app.slug);
-                        let _ = std::process::Command::new("open").arg(url).spawn();
-                    }
-                    "all" => {
-                        let url = format!("https://github.com/{}/releases", app.slug);
-                        let _ = std::process::Command::new("open").arg(url).spawn();
-                    }
-                    "uninstall" => self.uninstall(idx),
-                    "unsub" => self.delete_subscription(idx),
-                    _ => {}
-                }
-                if action != &"versions" {
-                    self.menu_for = None;
-                }
-                y += row_h;
-            }
-            if resp.hovered() {
-                painter.rect_filled(row, 0, p.border);
-            }
-            painter.text(
-                pos2(row.min.x + 14.0, row.center().y),
-                Align2::LEFT_CENTER,
-                *label,
-                text(13.5),
-                p.text,
-            );
-            y += row_h;
-        }
-    }
-
     /// Open the version chooser for one app, asking GitHub for its whole
     /// release list on a worker thread.
-    fn open_versions(&mut self, idx: usize) {
+    pub(crate) fn open_versions(&mut self, idx: usize) {
         self.menu_for = None;
         self.picker = Some(Picker {
             idx,
@@ -2105,10 +2462,15 @@ impl Launcher {
         });
         let slug = repos()[idx].slug.to_string();
         let include_pre = self.settings.include_pre;
+        let token = if self.settings.github_token.trim().is_empty() {
+            None
+        } else {
+            Some(self.settings.github_token.clone())
+        };
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
-            let result = github::fetch_release_list(&slug, include_pre);
+            let result = github::fetch_release_list(&slug, include_pre, token.as_deref());
             let _ = tx.send(Msg::Versions { idx, result });
             ctx.request_repaint();
         });
@@ -2116,7 +2478,7 @@ impl Launcher {
 
     /// The notes of the newest release: its page on GitHub, where the whole
     /// write-up lives.
-    fn open_notes(&mut self, idx: usize) {
+    pub(crate) fn open_notes(&mut self, idx: usize) {
         let url = match self.state.release(idx) {
             Some(rel) if !rel.html_url.is_empty() => rel.html_url.clone(),
             _ => format!("https://github.com/{}/releases", repos()[idx].slug),
@@ -2149,8 +2511,9 @@ impl Launcher {
     /// It answers how many were added, how many were already there and how
     /// many lines could not be read, so the caller knows whether anything
     /// happened at all.
-    fn import_repositories(&mut self, text: &str) -> (usize, usize, usize) {
+    pub(crate) fn import_repositories(&mut self, text: &str) -> (usize, usize, usize) {
         let mut added = 0usize;
+        let mut restored = 0usize;
         let mut known = 0usize;
         let mut bad: Vec<String> = Vec::new();
         for line in text.lines() {
@@ -2158,13 +2521,29 @@ impl Launcher {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            // An address that is already in the list but switched off is
+            // switched back on rather than refused — this is where a
+            // subscription deleted earlier is added again. The switched-off
+            // list holds repository ids, not slugs.
+            if let Some(idx) = catalog::lookup(line) {
+                let id = repos()[idx].id.to_string();
+                if self.settings.disabled.iter().any(|d| d == &id) {
+                    self.settings.disabled.retain(|d| d != &id);
+                    self.state.subscribed[idx] = true;
+                    restored += 1;
+                } else {
+                    known += 1;
+                }
+                continue;
+            }
             match catalog::add_custom(line) {
                 Ok(idx) => {
+                    let id = repos()[idx].id.to_string();
                     let slug = repos()[idx].slug.to_string();
                     if !self.settings.custom.iter().any(|s| s == &slug) {
-                        self.settings.custom.push(slug.clone());
+                        self.settings.custom.push(slug);
                     }
-                    self.settings.disabled.retain(|d| d != &slug);
+                    self.settings.disabled.retain(|d| d != &id);
                     added += 1;
                 }
                 Err(e) => {
@@ -2177,17 +2556,28 @@ impl Launcher {
             }
         }
         state::save_settings(&self.settings);
-        if added > 0 {
+        if added > 0 || restored > 0 {
             self.rebuild_repos();
             self.pending_scroll_end = true;
         }
-        let mut report = format!("已导入 {added} 个仓库");
+        let mut parts: Vec<String> = Vec::new();
+        if added > 0 {
+            parts.push(format!("新增 {added} 个"));
+        }
+        if restored > 0 {
+            parts.push(format!("恢复订阅 {restored} 个"));
+        }
         if known > 0 {
-            report.push_str(&format!("，{known} 个此前已经订阅"));
+            parts.push(format!("{known} 个此前已经订阅"));
         }
         if !bad.is_empty() {
-            report.push_str(&format!("，{} 行无法识别", bad.len()));
+            parts.push(format!("{} 行无法识别", bad.len()));
         }
+        let report = if parts.is_empty() {
+            "没有可添加的地址".to_string()
+        } else {
+            format!("已导入：{}", parts.join("，"))
+        };
         self.state.status = report.clone();
         if let Some(batch) = self.batch.as_mut() {
             batch.report = Some(if bad.is_empty() {
@@ -2196,1147 +2586,368 @@ impl Launcher {
                 format!("{report}\n\n{}", bad.join("\n"))
             });
         }
-        (added, known, bad.len())
+        (added + restored, known, bad.len())
     }
 
-    /// The importer: a single address by default, or a whole list once
-    /// 批量添加 is chosen.
-    fn draw_batch(&mut self, ui: &mut Ui, full: Rect, p: &Palette) {
-        let Some(batch) = self.batch.as_mut() else {
-            return;
-        };
-        let scrim = ui.interact(full, egui::Id::unique("batch-scrim"), Sense::click());
-        ui.painter()
-            .rect_filled(full, 0, Color32::from_black_alpha(150));
-
-        let expanded = batch.expanded;
-        // The panel is short while one address is being typed, taller when
-        // the list is showing, and a little taller again when a report of a
-        // failed attempt needs the room.
-        let height = if expanded {
-            460.0
-        } else if batch.report.is_some() {
-            300.0
-        } else {
-            240.0
-        };
-        let rect = Rect::from_center_size(full.center(), vec2(680.0, height));
-        let painter = ui.painter().clone();
-        let painter = &painter;
-
-        // A soft shadow under the panel, so it sits above the page rather
-        // than being cut into it.
-        for (spread, alpha) in [(10.0f32, 18u8), (5.0, 26)] {
-            painter.rect_filled(
-                rect.translate(vec2(0.0, 6.0)).expand(spread),
-                radius(18),
-                Color32::from_black_alpha(alpha),
-            );
+    /// Total height of the redesigned list view (header + grouped rows).
+    fn list_height(&self, apps: &[usize]) -> f32 {
+        let head_h = 34.0;
+        let row_step = 56.0 + 6.0;
+        let installed = apps
+            .iter()
+            .filter(|&&i| self.state.is_installed(i))
+            .count();
+        let missing = apps.len() - installed;
+        let mut h = head_h + 6.0;
+        if installed > 0 {
+            h += installed as f32 * row_step;
         }
-        painter.rect_filled(rect, radius(12), p.bg);
-        painter.rect_stroke(rect, radius(12), line(p.border), StrokeKind::Middle);
-
-        // The head: what this is, and what it takes, on one line — the
-        // caption follows the title at its own size, and a close cell sits
-        // at the far right.
-        painter.text(
-            pos2(rect.min.x + 30.0, rect.min.y + 40.0),
-            Align2::LEFT_CENTER,
-            "添加订阅",
-            display(23.0),
-            p.text,
-        );
-        let caption_x = rect.min.x + 30.0 + measure(ui, "添加订阅", display(23.0)) + 14.0;
-        painter.text(
-            pos2(caption_x, rect.min.y + 40.0),
-            Align2::LEFT_CENTER,
-            if expanded {
-                "每行一个链接或 owner/repo；空行与以 # 开头的行会跳过。"
-            } else {
-                "粘贴一个链接或 owner/repo，回车即可添加。"
-            },
-            text(12.5),
-            p.faint,
-        );
-        let close = Rect::from_center_size(
-            pos2(rect.max.x - 44.0, rect.min.y + 40.0),
-            vec2(26.0, 26.0),
-        );
-        if expanded {
-            let count = batch
-                .text
-                .lines()
-                .filter(|line| {
-                    let line = line.trim();
-                    !line.is_empty() && !line.starts_with('#')
-                })
-                .count();
-            painter.text(
-                pos2(close.min.x - 14.0, rect.min.y + 40.0),
-                Align2::RIGHT_CENTER,
-                format!("{count} 个地址"),
-                label(11.5),
-                p.faint,
-            );
+        if missing > 0 {
+            h += SECTION_H + missing as f32 * row_step;
         }
-        let close_hit = ui.interact(close, egui::Id::unique("batch-close"), Sense::click());
-        if close_hit.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            painter.rect_filled(close, radius(4), p.surface);
-        }
-        let cross = Stroke::new(1.5, if close_hit.hovered() { p.text } else { p.muted });
-        let centre = close.center();
-        painter.line_segment(
-            [
-                pos2(centre.x - 5.0, centre.y - 5.0),
-                pos2(centre.x + 5.0, centre.y + 5.0),
-            ],
-            cross,
-        );
-        painter.line_segment(
-            [
-                pos2(centre.x + 5.0, centre.y - 5.0),
-                pos2(centre.x - 5.0, centre.y + 5.0),
-            ],
-            cross,
-        );
-        if close_hit.clicked() {
-            self.batch = None;
-            return;
-        }
-
-        // The box itself. Its hairline takes the accent while it holds the
-        // keyboard, so it is plain where a paste will land.
-        let box_rect = Rect::from_min_size(
-            pos2(rect.min.x + 30.0, rect.min.y + 76.0),
-            vec2(rect.width() - 60.0, if expanded { 196.0 } else { 46.0 }),
-        );
-        let field_id = if expanded {
-            egui::Id::unique("batch-field")
-        } else {
-            egui::Id::unique("batch-single")
-        };
-        let focused = ui.memory(|m| m.has_focus(field_id));
-        painter.rect_filled(box_rect, radius(8), p.search_fill);
-        painter.rect_stroke(
-            box_rect,
-            radius(8),
-            if focused {
-                Stroke::new(1.5, p.accent)
-            } else {
-                line(p.border)
-            },
-            StrokeKind::Middle,
-        );
-
-        // The field sits inside the box, with a little padding on each side.
-        let inner = if expanded {
-            Rect::from_min_max(
-                pos2(box_rect.min.x + 12.0, box_rect.min.y + 10.0),
-                pos2(box_rect.max.x - 12.0, box_rect.max.y - 10.0),
-            )
-        } else {
-            Rect::from_min_max(
-                pos2(box_rect.min.x + 12.0, box_rect.center().y - 10.0),
-                pos2(box_rect.max.x - 12.0, box_rect.center().y + 10.0),
-            )
-        };
-        let empty = if expanded {
-            batch.text.is_empty()
-        } else {
-            batch.single.is_empty()
-        };
-        if empty {
-            painter.text(
-                pos2(inner.min.x + 2.0, inner.center().y),
-                Align2::LEFT_CENTER,
-                if expanded {
-                    "https://github.com/owner/repo（一行一个）"
-                } else {
-                    "https://github.com/owner/repo"
-                },
-                text(12.0),
-                p.faint,
-            );
-        }
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(inner)
-                .id_salt(if expanded { "batch-text" } else { "batch-one" }),
-        );
-        // The keyboard goes into the box as soon as it opens, so a paste
-        // lands without a click first.
-        if batch.focus {
-            batch.focus = false;
-            ui.ctx().memory_mut(|m| m.request_focus(field_id));
-        }
-        let edit = if expanded {
-            TextEdit::multiline(&mut batch.text)
-                .id(field_id)
-                .text_color(p.text)
-                .frame(egui::Frame::NONE)
-                .desired_width(inner.width())
-        } else {
-            TextEdit::singleline(&mut batch.single)
-                .id(field_id)
-                .text_color(p.text)
-                .frame(egui::Frame::NONE)
-                .desired_width(inner.width())
-        };
-        child.add_sized(inner.size(), edit);
-
-        // The way between the two boxes.
-        let link_y = box_rect.max.y + 24.0;
-        let caption = if expanded {
-            "－ 收起批量输入"
-        } else {
-            "＋ 批量添加"
-        };
-        let link = Rect::from_min_size(
-            pos2(rect.min.x + 30.0, link_y - 11.0),
-            vec2(measure(ui, caption, text(12.5)) + 8.0, 22.0),
-        );
-        let link_hit = ui.interact(link, egui::Id::unique("batch-toggle"), Sense::click());
-        if link_hit.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        painter.text(
-            pos2(link.min.x, link.center().y),
-            Align2::LEFT_CENTER,
-            caption,
-            text(12.5),
-            if link_hit.hovered() { p.accent } else { p.muted },
-        );
-
-        // What came of the last attempt, under the link.
-        if let Some(report) = &batch.report {
-            let colour = if report.contains("无法识别") {
-                p.amber
-            } else {
-                p.muted
-            };
-            let mut lines: Vec<&str> = report.lines().collect();
-            if lines.len() > 4 {
-                lines.truncate(3);
-                lines.push("…");
-            }
-            let galley = painter.layout(
-                lines.join("\n"),
-                text(12.0),
-                colour,
-                rect.width() - 60.0,
-            );
-            painter.galley(pos2(rect.min.x + 30.0, link_y + 16.0), galley, colour);
-        }
-
-        // The foot: one button, 添加. The panel is closed by the close cell,
-        // a click on the page outside it, or Esc.
-        let import = Rect::from_min_size(
-            pos2(rect.max.x - 30.0 - 104.0, rect.max.y - 56.0),
-            vec2(104.0, 38.0),
-        );
-        let entered = !expanded
-            && focused
-            && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        let clicked = primary_button(
-            ui,
-            painter,
-            import,
-            egui::Id::unique("batch-import"),
-            "添加",
-            13.0,
-            full,
-            p,
-        );
-
-        if link_hit.clicked() {
-            batch.expanded = !expanded;
-            if batch.expanded {
-                if batch.text.trim().is_empty() {
-                    batch.text = batch.single.clone();
-                }
-            } else {
-                batch.single = batch
-                    .text
-                    .lines()
-                    .map(str::trim)
-                    .find(|line| !line.is_empty() && !line.starts_with('#'))
-                    .unwrap_or_default()
-                    .to_string();
-            }
-            batch.focus = true;
-            batch.report = None;
-            return;
-        }
-
-        if clicked || entered {
-            let text = if expanded {
-                batch.text.clone()
-            } else {
-                batch.single.clone()
-            };
-            let (added, known, bad) = self.import_repositories(&text);
-            // Done: the panel closes itself, and the footer says what
-            // happened. It stays only when every line was unreadable, so
-            // the mistake can be fixed where it was typed.
-            if added + known > 0 || bad == 0 {
-                self.batch = None;
-            }
-            return;
-        }
-
-        // A click on the page outside the panel closes it.
-        if scrim.clicked() {
-            let inside = ui
-                .input(|i| i.pointer.interact_pos())
-                .is_some_and(|at| rect.contains(at));
-            if !inside {
-                self.batch = None;
-            }
-        }
+        h + 8.0
     }
 
-    /// The version chooser: a panel in the middle of the window with the
-    /// release list, and a button that installs whichever one is chosen.
-    fn draw_picker(&mut self, ui: &mut Ui, full: Rect, p: &Palette) {
-        let Some(picker) = self.picker.as_mut() else {
-            return;
-        };
-        let idx = picker.idx;
-        let name = repos()[idx].name;
-        // A scrim, so a click outside the panel does not reach the cards.
-        ui.interact(
-            full,
-            egui::Id::unique("picker-scrim"),
-            Sense::click(),
-        );
-        ui.painter()
-            .rect_filled(full, 0, Color32::from_black_alpha(140));
+    /// Redesigned list view: sticky column header, installed/uninstalled grouping,
+    /// elevated rounded row cards with hover lift, real GitHub descriptions,
+    /// tinted status dots, and full-row click to open app details.
+    fn list(&mut self, ui: &mut Ui, band: Rect, apps: &[usize], p: &Palette) {
+        let head_h = 34.0;
+        let row_h = 56.0;
+        let row_gap = 6.0;
+        let dark = p.bg.r() < 128;
+        let green = Color32::from_rgb(0x3D, 0xC9, 0x7A);
 
-        let w = 560.0;
-        let panel_h = 268.0;
-        let rect = Rect::from_center_size(full.center(), vec2(w, panel_h));
-        let painter = ui.painter().clone();
-        let painter = &painter;
-        painter.rect_filled(rect, radius(6), p.bg);
-        painter.rect_stroke(rect, 0, line(p.border), StrokeKind::Middle);
+        let left = band.min.x + MARGIN;
+        let right = band.max.x - RIGHT_GUTTER;
+        let row_w = (right - left).max(200.0);
 
-        painter.text(
-            pos2(rect.min.x + 28.0, rect.min.y + 34.0),
-            Align2::LEFT_CENTER,
-            format!("{name} · 选择版本"),
-            display(22.0),
-            p.text,
-        );
+        // Column right-anchors measured leftward from the row's right edge.
+        let more_w = 30.0;
+        let act_w = 88.0;
+        let more_x = right - 12.0 - more_w;
+        let act_x = more_x - 6.0 - act_w;
+        let author_r = act_x - 20.0;
+        let date_r = author_r - 96.0;
+        let ver_r = date_r - 108.0;
+        let state_r = ver_r - 106.0;
 
-        painter.text(
-            pos2(rect.min.x + 28.0, rect.min.y + 74.0),
-            Align2::LEFT_CENTER,
-            "版本",
-            text(13.0),
-            p.muted,
-        );
+        // Sticky column header at the top of the band.
+        let head_rect = Rect::from_min_max(band.min, pos2(band.max.x, band.min.y + head_h));
+        let rows_band = Rect::from_min_max(pos2(band.min.x, head_rect.max.y), band.max);
 
-        // The chosen version, in a box that opens a list.
-        let field = Rect::from_min_size(
-            pos2(rect.min.x + 28.0, rect.min.y + 90.0),
-            vec2(w - 56.0, 40.0),
-        );
-        painter.rect_filled(field, 0, p.search_fill);
-        painter.rect_stroke(field, 0, line(p.border), StrokeKind::Middle);
-        let caption = match picker.list.get(picker.chosen) {
-            Some(rel) => {
-                let tag = version::clean_tag(&rel.tag).to_uppercase();
-                if picker.chosen == 0 {
-                    format!("V{tag}（最新发布）")
-                } else {
-                    format!("V{tag}")
-                }
+        // Group installed first, uninstalled below a subtle divider.
+        let installed: Vec<usize> = apps
+            .iter()
+            .copied()
+            .filter(|&i| self.state.is_installed(i))
+            .collect();
+        let missing: Vec<usize> = apps
+            .iter()
+            .copied()
+            .filter(|&i| !self.state.is_installed(i))
+            .collect();
+
+        let mut y = rows_band.min.y + 6.0 - self.state.scroll;
+        for (group, dim) in [(&installed, false), (&missing, true)] {
+            if group.is_empty() {
+                continue;
             }
-            None if picker.loading => "正在获取版本…".to_string(),
-            None => "没有可选版本".to_string(),
-        };
-        painter.text(
-            pos2(field.min.x + 14.0, field.center().y),
-            Align2::LEFT_CENTER,
-            &caption,
-            text(14.0),
-            p.text,
-        );
-        caret_down(
-            painter,
-            Rect::from_center_size(
-                pos2(field.max.x - 20.0, field.center().y),
-                vec2(12.0, 12.0),
-            ),
-            p.muted,
-        );
-        let resp = ui.interact(
-            field,
-            egui::Id::unique("picker-field"),
-            Sense::click(),
-        );
-        if resp.clicked() && !picker.list.is_empty() {
-            picker.open = !picker.open;
-        }
-        if picker.open {
-            let rows = picker.list.len().min(6);
-            let list_h = rows as f32 * 36.0;
-            let list = Rect::from_min_size(
-                pos2(field.min.x, field.max.y + 2.0),
-                vec2(field.width(), list_h),
-            );
-            painter.rect_filled(list, 0, p.surface);
-            painter.rect_stroke(list, 0, line(p.border), StrokeKind::Middle);
-            for (i, rel) in picker.list.iter().take(rows).enumerate() {
-                let row = Rect::from_min_size(
-                    pos2(list.min.x, list.min.y + i as f32 * 36.0),
-                    vec2(list.width(), 36.0),
-                );
-                let hovered = row.contains(
-                    ui.input(|i| i.pointer.hover_pos().unwrap_or_default()),
-                );
-                if hovered {
-                    painter.rect_filled(row, 0, p.border);
-                }
-                if i == picker.chosen {
-                    painter.rect_filled(
-                        Rect::from_min_size(row.min, vec2(3.0, row.height())),
-                        0,
-                        p.accent,
+            if dim {
+                let sec = Rect::from_min_size(pos2(left, y), vec2(row_w, SECTION_H));
+                let vis = sec.intersect(rows_band);
+                if vis.is_positive() {
+                    let clip = ui.painter().with_clip_rect(vis);
+                    let heading = format!("未安装 · {}", group.len());
+                    clip.text(
+                        pos2(sec.min.x + 2.0, sec.center().y),
+                        Align2::LEFT_CENTER,
+                        &heading,
+                        label(11.5),
+                        p.faint,
+                    );
+                    let hw = measure(ui, &heading, label(11.5));
+                    clip.hline(
+                        (sec.min.x + hw + 12.0)..=sec.max.x,
+                        sec.center().y,
+                        line(p.border),
                     );
                 }
-                let tag = version::clean_tag(&rel.tag).to_uppercase();
-                let label = if i == 0 {
-                    format!("V{tag}（最新发布）")
+                y += SECTION_H;
+            }
+
+            for &idx in group {
+                let row = Rect::from_min_size(pos2(left, y), vec2(row_w, row_h));
+                y += row_h + row_gap;
+                let vis = row.intersect(rows_band);
+                if !vis.is_positive() {
+                    continue;
+                }
+
+                let app = &repos()[idx];
+                let clip = ui.painter().with_clip_rect(vis);
+                let painter = &clip;
+
+                let is_inst = self.state.is_installed(idx);
+                let has_update = self.state.has_update(idx);
+                let busy = self.state.busy(idx);
+
+                // Full-row interaction excluding the right-side action buttons so clicks never bleed through.
+                let row_click_area = Rect::from_min_max(vis.min, pos2((act_x - 8.0).max(vis.min.x), vis.max.y));
+                let row_resp = if row_click_area.is_positive() {
+                    ui.interact(
+                        row_click_area,
+                        ui.scope_id().with(("listrow", app.id)),
+                        Sense::click(),
+                    )
                 } else {
-                    format!("V{tag}")
+                    ui.interact(vis, ui.scope_id().with(("listrow", app.id)), Sense::click())
                 };
-                painter.text(
-                    pos2(row.min.x + 14.0, row.center().y),
-                    Align2::LEFT_CENTER,
-                    label,
-                    text(13.5),
-                    if rel.asset.is_some() { p.text } else { p.faint },
-                );
-                let hit = ui.interact(
-                    row,
-                    egui::Id::unique(("picker-row", i)),
-                    Sense::click(),
-                );
-                if hit.clicked() {
-                    picker.chosen = i;
-                    picker.open = false;
+                let hovered = row_resp.hovered()
+                    || ui
+                        .input(|i| i.pointer.hover_pos())
+                        .is_some_and(|pos| vis.contains(pos));
+                if row_resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-            }
-        }
-
-        // The fine print, then the two buttons.
-        let hint_y = rect.min.y + 152.0;
-        painter.text(
-            pos2(rect.min.x + 28.0, hint_y),
-            Align2::LEFT_CENTER,
-            "旧版可能无法打开你已保存的文件；安装会替换「应用程序」里的同名应用。",
-            text(12.5),
-            p.faint,
-        );
-        if let Some(err) = &picker.error {
-            painter.text(
-                pos2(rect.min.x + 28.0, hint_y + 22.0),
-                Align2::LEFT_CENTER,
-                err,
-                text(12.5),
-                p.amber,
-            );
-        }
-
-        let close = Rect::from_min_size(
-            pos2(rect.min.x + 28.0, rect.max.y - 60.0),
-            vec2(150.0, 40.0),
-        );
-        if action_button(ui, painter, close, egui::Id::unique("picker-close"), "关闭", 13.5, full, p)
-        {
-            self.picker = None;
-            return;
-        }
-        let can_install = picker
-            .list
-            .get(picker.chosen)
-            .map(|r| r.asset.is_some())
-            .unwrap_or(false);
-        let install_label = match picker.list.get(picker.chosen) {
-            Some(rel) => format!(
-                "安装版本 V{}",
-                version::clean_tag(&rel.tag).to_uppercase()
-            ),
-            None => "安装版本".to_string(),
-        };
-        let install = Rect::from_min_max(
-            pos2(rect.max.x - 28.0 - 220.0, rect.max.y - 60.0),
-            pos2(rect.max.x - 28.0, rect.max.y - 20.0),
-        );
-        if can_install {
-            if primary_button(
-                ui,
-                painter,
-                install,
-                egui::Id::unique("picker-install"),
-                &install_label,
-                13.5,
-                full,
-                p,
-            ) {
-                let rel = picker.list[picker.chosen].clone();
-                if let Some(asset) = rel.asset.clone() {
-                    self.picker = None;
-                    self.start_download(idx, asset);
-                }
-            }
-        } else {
-            let faded = Rect::from_min_size(install.min, install.size());
-            painter.rect_stroke(faded, 0, line(p.border), StrokeKind::Middle);
-            painter.text(
-                faded.center(),
-                Align2::CENTER_CENTER,
-                &install_label,
-                text(13.5),
-                p.faint,
-            );
-        }
-    }
-
-    /// The sort dropdown, drawn on top of the cards.
-    fn draw_sort_dropdown(&mut self, ui: &mut Ui, sort_rect: Rect, p: &Palette) {
-        let painter = ui.painter();
-        let mut chosen = self.state.sort;
-        let list_rect = Rect::from_min_max(
-            pos2(sort_rect.min.x, sort_rect.max.y),
-            pos2(sort_rect.max.x, sort_rect.max.y + 56.0),
-        );
-        painter.rect_filled(list_rect, 0, p.surface);
-        painter.rect_stroke(list_rect, 0, line(p.border), StrokeKind::Middle);
-        for (i, option) in [SortBy::Name, SortBy::Updated].iter().enumerate() {
-            let row = Rect::from_min_max(
-                pos2(list_rect.min.x, list_rect.min.y + i as f32 * 28.0),
-                pos2(list_rect.max.x, list_rect.min.y + (i as f32 + 1.0) * 28.0),
-            );
-            let resp = ui.interact(row, ui.scope_id().with(("sort", i)), Sense::click());
-            if resp.clicked() {
-                chosen = *option;
-                self.sort_open = false;
-            }
-            if resp.hovered() {
-                painter.rect_filled(row, 0, p.border);
-            }
-            painter.text(
-                pos2(row.min.x + 12.0, row.center().y),
-                Align2::LEFT_CENTER,
-                sort_option_label(*option),
-                text(13.0),
-                p.text,
-            );
-        }
-        self.state.sort = chosen;
-    }
-
-    /// The settings page: appearance on the left, updates and folders on
-    /// the right, with the exit and done buttons along the bottom.
-    fn settings_page(&mut self, ui: &mut Ui, band: Rect, p: &Palette) {
-        let painter = ui.painter().with_clip_rect(band);
-        let w = band.width() - 2.0 * DETAIL_MARGIN;
-        let left = band.min.x + DETAIL_MARGIN;
-        let col_w = (w - 40.0) / 2.0;
-        let right_x = left + col_w + 40.0;
-
-        // The page's own heading.
-        draw_g_mark(
-            &painter,
-            Rect::from_center_size(pos2(left + 11.0, band.min.y + 33.0), vec2(22.0, 20.0)),
-            p.text,
-        );
-        painter.text(
-            pos2(left + 32.0, band.min.y + 34.0),
-            Align2::LEFT_CENTER,
-            "设置",
-            display(26.0),
-            p.text,
-        );
-        painter.text(
-            pos2(left + 100.0, band.min.y + 36.0),
-            Align2::LEFT_CENTER,
-            format!("GITUP LAUNCHER V{}", env!("CARGO_PKG_VERSION").to_uppercase()),
-            label(11.0),
-            p.muted,
-        );
-        painter.hline(
-            band.min.x + DETAIL_MARGIN..=band.max.x - DETAIL_MARGIN,
-            band.min.y + 66.0,
-            line(p.border),
-        );
-
-        let mut y = band.min.y + 96.0;
-        // ------------------------------------------------ left: appearance
-        painter.text(
-            pos2(left, y),
-            Align2::LEFT_CENTER,
-            "外观",
-            text(15.0),
-            p.text,
-        );
-        y += 34.0;
-        // The segmented control.
-        let seg_w = col_w;
-        let cell_w = seg_w / 3.0;
-        let seg = Rect::from_min_size(pos2(left, y), vec2(seg_w, 32.0));
-        for (i, (word, mode)) in [
-            ("跟随系统", state::ThemeMode::System),
-            ("深色", state::ThemeMode::Dark),
-            ("浅色", state::ThemeMode::Light),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let cell = Rect::from_min_max(
-                pos2(left + i as f32 * cell_w, seg.min.y),
-                pos2(left + (i as f32 + 1.0) * cell_w, seg.max.y),
-            );
-            let chosen = self.settings.theme == *mode;
-            if chosen {
-                painter.rect_filled(cell, 0, p.text);
-            } else {
-                painter.rect_stroke(cell, 0, line(p.border), StrokeKind::Middle);
-            }
-            painter.text(
-                pos2(cell.center().x, cell.center().y),
-                Align2::CENTER_CENTER,
-                *word,
-                text(13.0),
-                if chosen { p.bg } else { p.text },
-            );
-            let hit = cell.intersect(band);
-            if hit.is_positive() {
-                let resp = ui.interact(
-                    hit,
-                    ui.scope_id().with(("settings-theme", i)),
-                    Sense::click(),
-                );
-                if resp.clicked() && self.settings.theme != *mode {
-                    self.settings.theme = *mode;
-                    self.ctx.set_theme(theme_preference(*mode));
-                    state::save_settings(&self.settings);
-                }
-            }
-        }
-        y += 54.0;
-
-        // ------------------------------------------------- left: updates
-        painter.text(
-            pos2(left, y),
-            Align2::LEFT_CENTER,
-            "更新",
-            text(15.0),
-            p.text,
-        );
-        y += 34.0;
-        for (key, word, hint) in [
-            ("auto_check", "启动时自动检查更新", "打开启动器时自动向 GitHub 查询各仓库的最新发布。"),
-            ("include_pre", "包含预发布版本", "把测试版和候选版也当作可安装的更新。"),
-        ] {
-            let checked = if key == "auto_check" {
-                self.settings.auto_check
-            } else {
-                self.settings.include_pre
-            };
-            let box_r = Rect::from_min_size(pos2(left, y - 9.0), vec2(18.0, 18.0));
-            painter.rect_stroke(box_r, radius(4), line(p.border), StrokeKind::Middle);
-            if checked {
-                painter.rect_filled(box_r, radius(4), p.text);
-                let c = box_r.center();
-                let s = Stroke::new(2.0, p.bg);
-                painter.line_segment(
-                    [egui::pos2(c.x - 4.0, c.y + 0.5), egui::pos2(c.x - 1.5, c.y + 3.5)],
-                    s,
-                );
-                painter.line_segment(
-                    [egui::pos2(c.x - 1.5, c.y + 3.5), egui::pos2(c.x + 4.5, c.y - 3.0)],
-                    s,
-                );
-            }
-            painter.text(
-                pos2(box_r.max.x + 10.0, box_r.center().y),
-                Align2::LEFT_CENTER,
-                word,
-                text(14.0),
-                p.text,
-            );
-            painter.text(
-                pos2(box_r.max.x + 10.0, box_r.center().y + 18.0),
-                Align2::LEFT_CENTER,
-                hint,
-                text(11.5),
-                p.faint,
-            );
-            let hit = Rect::from_min_size(
-                pos2(left, y - 14.0),
-                vec2(measure(ui, word, text(14.0)) + 34.0, 30.0),
-            )
-            .intersect(band);
-            if hit.is_positive() {
-                let resp = ui.interact(
-                    hit,
-                    ui.scope_id().with(("settings-check", key)),
-                    Sense::click(),
-                );
-                if resp.clicked() {
-                    if key == "auto_check" {
-                        self.settings.auto_check = !self.settings.auto_check;
-                    } else {
-                        self.settings.include_pre = !self.settings.include_pre;
-                    }
-                    state::save_settings(&self.settings);
-                }
-            }
-            y += 52.0;
-        }
-        // The check-now button.
-        let check = Rect::from_min_size(pos2(left, y - 6.0), vec2(140.0, 32.0));
-        painter.rect_stroke(check, 0, line(p.border), StrokeKind::Middle);
-        painter.text(
-            pos2(check.center().x, check.center().y),
-            Align2::CENTER_CENTER,
-            "立即检查更新",
-            text(13.0),
-            p.text,
-        );
-        let hit = check.intersect(band);
-        if hit.is_positive() {
-            let resp = ui.interact(hit, ui.scope_id().with("settings-check-now"), Sense::click());
-            if resp.clicked() {
-                self.spawn_meta_fetch_all();
-            }
-        }
-
-        // --------------------------------------------- right: install folder
-        let mut ry = band.min.y + 96.0;
-        painter.text(
-            pos2(right_x, ry),
-            Align2::LEFT_CENTER,
-            "默认安装文件夹",
-            text(15.0),
-            p.text,
-        );
-        ry += 34.0;
-        let folder = Rect::from_min_size(pos2(right_x, ry), vec2(col_w, 36.0));
-        painter.rect_stroke(folder, 0, line(p.border), StrokeKind::Middle);
-        painter.text(
-            pos2(folder.min.x + 14.0, folder.center().y),
-            Align2::LEFT_CENTER,
-            &self.settings.install_dir,
-            text(14.0),
-            p.text,
-        );
-        ry += 52.0;
-        painter.text(
-            pos2(right_x, ry),
-            Align2::LEFT_CENTER,
-            "应用会放置在此文件夹内。新安装的应用使用此文件夹，更新时保留当前位置。",
-            text(11.5),
-            p.faint,
-        );
-        ry += 30.0;
-        painter.text(
-            pos2(right_x, ry),
-            Align2::LEFT_CENTER,
-            "安装到「应用程序」需要一次管理员授权；也可以改为用户目录下的文件夹。",
-            text(11.5),
-            p.faint,
-        );
-        // A rule and some air between the two sections, so the folder's
-        // fine print never runs into the subscriptions heading.
-        ry += 26.0;
-        painter.hline(right_x..=right_x + col_w, ry, line(p.border));
-        ry += 32.0;
-
-        // ------------------------------------- right: managed subscriptions
-        painter.text(
-            pos2(right_x, ry),
-            Align2::LEFT_CENTER,
-            "订阅仓库",
-            text(15.0),
-            p.text,
-        );
-        ry += 30.0;
-        painter.text(
-            pos2(right_x, ry),
-            Align2::LEFT_CENTER,
-            "列出的仓库会被检查发布并显示在主界面；点 × 从订阅中移除。",
-            text(11.5),
-            p.faint,
-        );
-        ry += 28.0;
-        let list = repos();
-        let sub_cols = 2;
-        let sub_cell_w = (col_w - 12.0) / sub_cols as f32;
-        let mut slot = 0usize;
-        for (i, repo) in list.iter().enumerate() {
-            if i >= self.state.subscribed.len() || !self.state.subscribed[i] {
-                continue;
-            }
-            let col = slot % sub_cols;
-            let row = slot / sub_cols;
-            slot += 1;
-            let x = right_x + col as f32 * (sub_cell_w + 12.0);
-            let yy = ry + row as f32 * 30.0;
-            painter.text(
-                pos2(x, yy),
-                Align2::LEFT_CENTER,
-                repo.name,
-                text(13.0),
-                p.text,
-            );
-            // The cross sits right after the name, and removes the row.
-            let name_w = measure(ui, repo.name, text(13.0));
-            let cx_x = (x + name_w + 10.0).min(x + sub_cell_w - 24.0);
-            let cx = Rect::from_min_size(pos2(cx_x, yy - 10.0), vec2(20.0, 20.0));
-            let over = cx.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()));
-            painter.rect_stroke(
-                cx,
-                radius(4),
-                if over {
-                    Stroke::new(1.0, p.amber)
-                } else {
-                    line(p.border)
-                },
-                StrokeKind::Middle,
-            );
-            let c = cx.center();
-            let st = Stroke::new(1.5, if over { p.amber } else { p.text });
-            painter.line_segment(
-                [pos2(c.x - 4.0, c.y - 4.0), pos2(c.x + 4.0, c.y + 4.0)],
-                st,
-            );
-            painter.line_segment(
-                [pos2(c.x + 4.0, c.y - 4.0), pos2(c.x - 4.0, c.y + 4.0)],
-                st,
-            );
-            let hit = cx.intersect(band).expand(4.0);
-            if hit.is_positive() {
-                let resp = ui.interact(
-                    hit,
-                    egui::Id::unique(("settings-remove", repo.slug)),
-                    Sense::click(),
-                );
-                if resp.clicked() {
-                    if catalog::is_builtin(repo.slug) {
-                        self.toggle_subscription(i);
-                    } else {
-                        self.remove_repository(i);
-                    }
-                }
-            }
-        }
-        let sub_rows = slot.div_ceil(sub_cols) as f32;
-        ry += sub_rows * 30.0 + 4.0;
-        // A way back for built-in repositories that were removed.
-        let removed_builtin = list.iter().enumerate().any(|(i, r)| {
-            catalog::is_builtin(r.slug)
-                && i < self.state.subscribed.len()
-                && !self.state.subscribed[i]
-        });
-        if removed_builtin {
-            let caption = "恢复默认仓库";
-            let r = Rect::from_min_size(
-                pos2(right_x, ry),
-                vec2(measure(ui, caption, text(12.0)) + 8.0, 20.0),
-            );
-            let over = r.contains(ui.input(|i| i.pointer.hover_pos().unwrap_or_default()));
-            painter.text(
-                pos2(r.min.x, r.center().y),
-                Align2::LEFT_CENTER,
-                caption,
-                text(12.0),
-                if over { p.accent } else { p.muted },
-            );
-            let resp = ui.interact(
-                r.intersect(band),
-                egui::Id::unique("settings-restore"),
-                Sense::click(),
-            );
-            if resp.clicked() {
-                self.settings.disabled.clear();
-                for i in 0..self.state.subscribed.len() {
-                    self.state.subscribed[i] = true;
-                }
-                state::save_settings(&self.settings);
-                self.spawn_meta_fetch_all();
-                self.state.status = "已恢复全部内置仓库".to_string();
-            }
-        }
-
-        // --------------------------------------------- the bottom buttons
-        let by = band.max.y - 44.0;
-        let quit = Rect::from_min_size(pos2(left, by), vec2(210.0, 36.0));
-        painter.rect_stroke(quit, 0, line(p.border), StrokeKind::Middle);
-        painter.text(
-            pos2(quit.center().x, quit.center().y),
-            Align2::CENTER_CENTER,
-            format!("退出 GITUP LAUNCHER"),
-            text(13.0),
-            p.muted,
-        );
-        let hit = quit.intersect(band);
-        if hit.is_positive() {
-            let resp = ui.interact(hit, ui.scope_id().with("settings-quit"), Sense::click());
-            if resp.clicked() {
-                std::process::exit(0);
-            }
-        }
-        let done = Rect::from_min_size(pos2(band.max.x - DETAIL_MARGIN - 120.0, by), vec2(120.0, 36.0));
-        painter.rect_filled(done, radius(4), p.text);
-        painter.text(
-            pos2(done.center().x, done.center().y),
-            Align2::CENTER_CENTER,
-            "完成",
-            text(14.0),
-            p.bg,
-        );
-        let hit = done.intersect(band);
-        if hit.is_positive() {
-            let resp = ui.interact(hit, ui.scope_id().with("settings-done"), Sense::click());
-            if resp.clicked() {
-                self.page = Page::Grid;
-            }
-        }
-    }
-
-
-    /// The list view: a table with a header row, one row per app, riding
-    /// the same scroll offset. The columns run 应用, 状态, 版本, 发布日期,
-    /// 作者, then the action button and the little menu.
-    fn list(&mut self, ui: &mut Ui, band: Rect, apps: &[usize], p: &Palette) {
-        let painter = ui.painter().with_clip_rect(band);
-        // Roomy rows: the table was too tight to read at a glance.
-        let row_h = 62.0;
-        let head_h = 44.0;
-        let right = band.max.x - RIGHT_GUTTER;
-        // The right-hand column edges, working leftward from the window's
-        // right edge: the little menu, the action button, then the author,
-        // the date, the version and the status pill.
-        let more_x = right - 37.0;
-        let act_x = more_x - 12.0 - 92.0;
-        let author_r = act_x - 30.0;
-        let date_r = author_r - 104.0;
-        let ver_r = date_r - 124.0;
-        let state_r = ver_r - 90.0;
-
-        // The header row, pinned above the rows.
-        if band.height() > 40.0 {
-            painter.hline(band.min.x + MARGIN..=right, band.min.y + head_h, line(p.border));
-            let hy = band.min.y + head_h * 0.5;
-            painter.text(
-                pos2(band.min.x + MARGIN + 2.0, hy),
-                Align2::LEFT_CENTER,
-                "应用",
-                text(12.0),
-                p.faint,
-            );
-            for (word, xr) in [
-                ("状态", state_r),
-                ("版本", ver_r),
-                ("发布日期", date_r),
-                ("作者", author_r),
-            ] {
-                painter.text(
-                    pos2(xr, hy),
-                    Align2::RIGHT_CENTER,
-                    word,
-                    text(12.0),
-                    p.faint,
-                );
-            }
-        }
-
-        let scroll = self.state.scroll;
-        for (i, &idx) in apps.iter().enumerate() {
-            let app = &repos()[idx];
-            let y = band.min.y + head_h + i as f32 * (row_h + 8.0) - scroll;
-            if y + row_h < band.min.y + head_h || y > band.max.y {
-                continue;
-            }
-            let row = Rect::from_min_size(
-                pos2(band.min.x + MARGIN, y),
-                vec2(band.width() - MARGIN - RIGHT_GUTTER, row_h),
-            );
-            let vis = row.intersect(band);
-            let clip = ui.painter().with_clip_rect(vis);
-            clip.rect_stroke(row, 0, line(p.border), StrokeKind::Middle);
-
-            let tile = Rect::from_min_size(
-                pos2(row.min.x + 10.0, row.center().y - 18.0),
-                vec2(36.0, 36.0),
-            );
-            // Clicking the tile opens the app's own page.
-            let tile_hit = tile.intersect(band);
-            if tile_hit.is_positive() {
-                let resp = ui.interact(
-                    tile_hit,
-                    ui.scope_id().with(("rowtile", app.id)),
-                    Sense::click(),
-                );
-                if resp.clicked() {
+                if row_resp.clicked() {
                     self.open_page(idx);
                 }
-            }
-            self.draw_tile(&clip, tile, idx, 9);
 
-            clip.text(
-                pos2(tile.max.x + 14.0, row.center().y - 9.0),
-                Align2::LEFT_CENTER,
-                app.name,
-                display(15.0),
-                p.text,
-            );
-            clip.text(
-                pos2(tile.max.x + 14.0, row.center().y + 10.0),
-                Align2::LEFT_CENTER,
-                app.tagline,
-                text(11.5),
-                p.muted,
-            );
+                let row_bg = if hovered {
+                    if dark {
+                        Color32::from_rgb(0x16, 0x18, 0x1D)
+                    } else {
+                        Color32::from_rgb(0xF3, 0xF6, 0xFB)
+                    }
+                } else if dark {
+                    Color32::from_rgb(0x0C, 0x0D, 0x0F)
+                } else {
+                    Color32::WHITE
+                };
+                let border_stroke = if hovered {
+                    Stroke::new(1.5, p.accent)
+                } else if has_update {
+                    Stroke::new(
+                        1.0,
+                        Color32::from_rgba_unmultiplied(p.amber.r(), p.amber.g(), p.amber.b(), 140),
+                    )
+                } else {
+                    line(p.border)
+                };
+                painter.rect_filled(row, radius(8), row_bg);
+                painter.rect_stroke(row, radius(8), border_stroke, StrokeKind::Middle);
 
-            // The status pill. The window never shows a lie: an app with
-            // an update waiting reads 可更新 even though it is installed.
-            let installed = self.state.is_installed(idx);
-            let has_update = self.state.has_update(idx);
-            let (word, color) = if has_update {
-                ("可更新", p.amber)
-            } else if installed {
-                ("已安装", Color32::from_rgb(0x4A, 0xD9, 0x8B))
-            } else {
-                ("可安装", p.muted)
-            };
-            let pw = measure(ui, word, label(11.0)) + 22.0;
-            let pill = Rect::from_min_max(
-                pos2(state_r - pw, row.center().y - 11.0),
-                pos2(state_r, row.center().y + 11.0),
-            );
-            clip.rect_stroke(pill, radius(11), Stroke::new(1.0, color), StrokeKind::Middle);
-            clip.text(
-                pos2(pill.center().x, pill.center().y),
-                Align2::CENTER_CENTER,
-                word,
-                label(11.0),
-                color,
-            );
-
-            // Version and date, from the live release when it has arrived.
-            let (version, date) = match &self.state.repos[idx].fetch {
-                FetchState::Pending => ("…".to_string(), "…".to_string()),
-                FetchState::Done(Ok(rel)) => (
-                    format!("V{}", version::clean_tag(&rel.tag).to_uppercase()),
-                    version::fmt_date(&rel.published),
-                ),
-                FetchState::Done(Err(_)) => ("—".to_string(), "—".to_string()),
-            };
-            clip.text(
-                pos2(ver_r, row.center().y),
-                Align2::RIGHT_CENTER,
-                version,
-                text(13.0),
-                p.text,
-            );
-            clip.text(
-                pos2(date_r, row.center().y),
-                Align2::RIGHT_CENTER,
-                date,
-                text(13.0),
-                p.muted,
-            );
-            let author = catalog::owner_of(app.slug).to_uppercase();
-            clip.text(
-                pos2(author_r, row.center().y),
-                Align2::RIGHT_CENTER,
-                fit_text(ui, &author, text(13.0), 86.0),
-                text(13.0),
-                p.muted,
-            );
-
-            // The action button, with its fill for running downloads.
-            let busy = self.state.busy(idx);
-            let (phase, progress) = self
-                .state
-                .repos[idx]
-                .job
-                .as_ref()
-                .map(|j| (j.phase, j.progress))
-                .unwrap_or((JobPhase::Downloading, 0.0));
-            let label_text = self.button_label(idx).to_string();
-            let btn = Rect::from_min_size(pos2(act_x, row.center().y - 13.0), vec2(86.0, 26.0));
-            let update_waiting = self.state.has_update(idx) && !busy;
-            let pressed = if update_waiting {
-                primary_button(
-                    ui,
-                    &clip,
-                    btn,
-                    egui::Id::unique(("row", app.id)),
-                    &label_text,
-                    12.5,
-                    band,
-                    p,
-                )
-            } else {
-                action_button(
-                    ui,
-                    &clip,
-                    btn,
-                    egui::Id::unique(("row", app.id)),
-                    &label_text,
-                    12.5,
-                    band,
-                    p,
-                )
-            };
-            if pressed {
-                self.act(idx);
-            }
-            if busy && phase == JobPhase::Downloading && progress > 0.0 {
-                let filled = Rect::from_min_max(
-                    btn.min,
-                    pos2(btn.min.x + btn.width() * progress, btn.max.y),
+                // App icon
+                let tile = Rect::from_min_size(
+                    pos2(row.min.x + 12.0, row.center().y - 18.0),
+                    vec2(36.0, 36.0),
                 );
-                clip.rect_filled(filled, 0, p.surface);
-                clip.rect_stroke(btn, 0, line(p.border), StrokeKind::Middle);
-                clip.text(
-                    pos2(btn.center().x, btn.center().y),
-                    Align2::CENTER_CENTER,
-                    &label_text,
-                    text(12.5),
+                self.draw_tile(painter, tile, idx, 9);
+
+                // Name + real 1-line summary spanning up to the status column
+                let text_x = tile.max.x + 12.0;
+                let text_room = (state_r - 82.0 - text_x).max(60.0);
+                let shown_name = fit_text(ui, app.name, display(15.5), text_room);
+                painter.text(
+                    pos2(text_x, row.center().y - 9.0),
+                    Align2::LEFT_CENTER,
+                    shown_name,
+                    display(15.5),
                     p.text,
                 );
-            }
+                let summary = self.summary_text(idx);
+                let shown_sum = fit_text(ui, &summary, text(12.0), text_room);
+                painter.text(
+                    pos2(text_x, row.center().y + 10.0),
+                    Align2::LEFT_CENTER,
+                    shown_sum,
+                    text(12.0),
+                    p.muted,
+                );
 
-            // The little menu at the far right.
-            let more = Rect::from_min_size(pos2(more_x, row.center().y - 13.0), vec2(37.0, 26.0));
-            if action_button(
-                ui,
-                &clip,
-                more,
-                egui::Id::unique(("rowmore", app.id)),
-                "…",
-                13.0,
-                band,
-                p,
-            ) {
-                self.menu_for = if self.menu_for == Some(idx) {
-                    None
+                // Soft tinted status badge with dot
+                let (st_word, st_color, filled_dot) = if has_update {
+                    ("可更新", p.amber, true)
+                } else if is_inst {
+                    ("已安装", green, true)
                 } else {
-                    Some(idx)
+                    ("未安装", p.muted, false)
                 };
-                self.sort_open = false;
+                let pw = measure(ui, st_word, label(11.0)) + 26.0;
+                let pill = Rect::from_min_max(
+                    pos2(state_r - pw, row.center().y - 11.0),
+                    pos2(state_r, row.center().y + 11.0),
+                );
+                painter.rect_filled(
+                    pill,
+                    radius(11),
+                    Color32::from_rgba_unmultiplied(st_color.r(), st_color.g(), st_color.b(), 24),
+                );
+                let dot_c = pos2(pill.min.x + 10.0, pill.center().y);
+                if filled_dot {
+                    painter.circle_filled(dot_c, 3.0, st_color);
+                } else {
+                    painter.circle_stroke(dot_c, 3.0, Stroke::new(1.2, st_color));
+                }
+                painter.text(
+                    pos2(pill.min.x + 18.0, pill.center().y),
+                    Align2::LEFT_CENTER,
+                    st_word,
+                    label(11.0),
+                    st_color,
+                );
+
+                // Version (with current -> latest hint when updatable)
+                let (ver_str, date_str) = match &self.state.repos[idx].fetch {
+                    FetchState::Pending => ("…".to_string(), "…".to_string()),
+                    FetchState::Done(Ok(rel)) => {
+                        let latest = version::clean_tag(&rel.tag).to_uppercase();
+                        let v = if has_update {
+                            if let Some(cur) = &self.state.repos[idx].installed {
+                                format!("V{} → V{latest}", cur.to_uppercase())
+                            } else {
+                                format!("V{latest}")
+                            }
+                        } else {
+                            format!("V{latest}")
+                        };
+                        (v, version::fmt_date(&rel.published))
+                    }
+                    FetchState::Done(Err(_)) => match &self.state.repos[idx].installed {
+                        Some(v) => (format!("V{}", v.to_uppercase()), "—".to_string()),
+                        None => ("—".to_string(), "—".to_string()),
+                    },
+                };
+                painter.text(
+                    pos2(ver_r, row.center().y),
+                    Align2::RIGHT_CENTER,
+                    fit_text(ui, &ver_str, label(12.0), 100.0),
+                    label(12.0),
+                    if has_update { p.amber } else { p.text },
+                );
+                painter.text(
+                    pos2(date_r, row.center().y),
+                    Align2::RIGHT_CENTER,
+                    date_str,
+                    text(12.5),
+                    p.muted,
+                );
+                let author = catalog::owner_of(app.slug).to_uppercase();
+                painter.text(
+                    pos2(author_r, row.center().y),
+                    Align2::RIGHT_CENTER,
+                    fit_text(ui, &author, label(11.5), 86.0),
+                    label(11.5),
+                    p.faint,
+                );
+
+                // Action button with rounded progress fill
+                let (phase, progress) = self.state.repos[idx]
+                    .job
+                    .as_ref()
+                    .map(|j| (j.phase, j.progress))
+                    .unwrap_or((JobPhase::Downloading, 0.0));
+                let label_text = self.button_label(idx);
+                let btn = Rect::from_min_size(pos2(act_x, row.center().y - 14.0), vec2(act_w, 28.0));
+                let update_waiting = has_update && !busy;
+                let pressed = if update_waiting {
+                    primary_button(
+                        ui,
+                        painter,
+                        btn,
+                        egui::Id::unique(("row", app.id)),
+                        &label_text,
+                        12.5,
+                        rows_band,
+                        p,
+                    )
+                } else {
+                    action_button(
+                        ui,
+                        painter,
+                        btn,
+                        egui::Id::unique(("row", app.id)),
+                        &label_text,
+                        12.5,
+                        rows_band,
+                        p,
+                    )
+                };
+                if pressed {
+                    self.act(idx);
+                }
+                if busy && phase == JobPhase::Downloading && progress > 0.0 {
+                    let filled = Rect::from_min_max(
+                        btn.min,
+                        pos2(btn.min.x + btn.width() * progress, btn.max.y),
+                    );
+                    painter.rect_filled(filled, radius(5), p.surface);
+                    painter.rect_stroke(btn, radius(5), line(p.border), StrokeKind::Middle);
+                    painter.text(
+                        btn.center(),
+                        Align2::CENTER_CENTER,
+                        &label_text,
+                        text(12.5),
+                        p.text,
+                    );
+                }
+
+                // Overflow menu button
+                let more =
+                    Rect::from_min_size(pos2(more_x, row.center().y - 14.0), vec2(more_w, 28.0));
+                if action_button(
+                    ui,
+                    painter,
+                    more,
+                    egui::Id::unique(("rowmore", app.id)),
+                    "…",
+                    13.0,
+                    rows_band,
+                    p,
+                ) {
+                    self.menu_for = if self.menu_for == Some(idx) {
+                        None
+                    } else {
+                        Some(idx)
+                    };
+                    self.sort_open = false;
+                }
+                if self.menu_for == Some(idx) {
+                    self.pending_menu = Some((more, idx));
+                }
+
+                // Subtle dim overlay for uninstalled rows when not hovered
+                if dim && !hovered {
+                    painter.rect_filled(
+                        vis,
+                        radius(8),
+                        Color32::from_rgba_unmultiplied(p.bg.r(), p.bg.g(), p.bg.b(), 85),
+                    );
+                }
             }
-            if self.menu_for == Some(idx) {
-                self.pending_menu = Some((more, idx));
-            }
+        }
+
+        // Paint sticky column header on top so scrolled rows slide cleanly underneath.
+        let head_painter = ui.painter().with_clip_rect(head_rect);
+        head_painter.rect_filled(head_rect, 0, p.bg);
+        head_painter.hline(left..=right, head_rect.max.y - 0.5, line(p.border));
+        let hy = head_rect.center().y;
+        head_painter.text(
+            pos2(left + 12.0, hy),
+            Align2::LEFT_CENTER,
+            "应用",
+            label(11.0),
+            p.faint,
+        );
+        for (word, xr) in [
+            ("状态", state_r),
+            ("版本", ver_r),
+            ("更新日期", date_r),
+            ("作者", author_r),
+            ("操作", right - 12.0),
+        ] {
+            head_painter.text(pos2(xr, hy), Align2::RIGHT_CENTER, word, label(11.0), p.faint);
         }
     }
 
@@ -3932,6 +3543,28 @@ fn save_releases(map: &std::collections::BTreeMap<String, serde_json::Value>) {
     let _ = std::fs::write(path, serde_json::to_string_pretty(map).unwrap_or_default());
 }
 
+/// Cached HTTP ETags per repository, kept between runs to save GitHub API quota.
+fn etags_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(home)
+        .join("Library/Application Support/GitupLauncher/etags.json")
+}
+
+fn load_etags() -> std::collections::BTreeMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(etags_path()) else {
+        return std::collections::BTreeMap::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn save_etags(map: &std::collections::BTreeMap<String, String>) {
+    let path = etags_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, serde_json::to_string_pretty(map).unwrap_or_default());
+}
+
 /// The Chinese half of a description that carries two languages, e.g.
 /// "中文简介 / An English summary". Anything else is left whole.
 fn first_language(text: &str) -> &str {
@@ -3952,7 +3585,7 @@ fn first_language(text: &str) -> &str {
 /// border, its fill and its caption; clicked, it says so. Everything else
 /// about it stays as the picture has it.
 #[allow(clippy::too_many_arguments)]
-fn action_button(
+pub(crate) fn action_button(
     ui: &mut Ui,
     painter: &egui::Painter,
     rect: Rect,
@@ -3974,11 +3607,11 @@ fn action_button(
         }
     }
     if hovered {
-        painter.rect_filled(rect, 0, p.surface);
+        painter.rect_filled(rect, radius(5), p.surface);
     }
     painter.rect_stroke(
         rect,
-        0,
+        radius(5),
         if hovered {
             Stroke::new(1.5, p.accent)
         } else {
@@ -3999,7 +3632,7 @@ fn action_button(
 /// The same button filled in: used for 更新, so a waiting update is the
 /// one thing on the card that shouts.
 #[allow(clippy::too_many_arguments)]
-fn primary_button(
+pub(crate) fn primary_button(
     ui: &mut Ui,
     painter: &egui::Painter,
     rect: Rect,
@@ -4029,7 +3662,7 @@ fn primary_button(
     };
     painter.rect_filled(
         rect,
-        0,
+        radius(5),
         if hovered { lighten(p.accent) } else { p.accent },
     );
     painter.text(
@@ -4040,6 +3673,47 @@ fn primary_button(
         p.bg,
     );
     clicked
+}
+
+/// Responsive column count for the card grid.
+fn grid_columns(avail_w: f32) -> usize {
+    ((avail_w + CARD_GAP) / (CARD_MIN_W + CARD_GAP))
+        .floor()
+        .max(2.0) as usize
+}
+
+/// Clamps wrapped text to at most two lines, appending an ellipsis when truncated.
+fn clamp_two_lines(ui: &Ui, text_in: &str, font: egui::FontId, wrap_w: f32) -> String {
+    let full = ui
+        .painter()
+        .layout(text_in.to_string(), font.clone(), Color32::WHITE, wrap_w);
+    if full.rows.len() <= 2 {
+        return text_in.to_string();
+    }
+    let mut chars: Vec<char> = text_in.chars().collect();
+    // Binary search the longest prefix that fits within 2 wrapped rows with "…".
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let mut cand: String = chars[..mid].iter().collect();
+        while cand.ends_with(char::is_whitespace) {
+            cand.pop();
+        }
+        cand.push('…');
+        let g = ui.painter().layout(cand, font.clone(), Color32::WHITE, wrap_w);
+        if g.rows.len() <= 2 {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    chars.truncate(lo);
+    let mut out: String = chars.into_iter().collect();
+    while out.ends_with(char::is_whitespace) {
+        out.pop();
+    }
+    out.push('…');
+    out
 }
 
 /// A transfer rate, said the way a person reads it.
@@ -4144,7 +3818,7 @@ fn set_movable_by_background(_movable: bool) -> bool {
 }
 
 /// A string shortened with an ellipsis until it fits the given width.
-fn fit_text(ui: &Ui, text_in: &str, font: egui::FontId, max_w: f32) -> String {
+pub(crate) fn fit_text(ui: &Ui, text_in: &str, font: egui::FontId, max_w: f32) -> String {
     if measure(ui, text_in, font.clone()) <= max_w {
         return text_in.to_string();
     }
@@ -4160,7 +3834,7 @@ fn fit_text(ui: &Ui, text_in: &str, font: egui::FontId, max_w: f32) -> String {
 }
 
 /// The egui preference for one of the appearance settings.
-fn theme_preference(mode: state::ThemeMode) -> egui::ThemePreference {
+pub(crate) fn theme_preference(mode: state::ThemeMode) -> egui::ThemePreference {
     match mode {
         state::ThemeMode::System => egui::ThemePreference::System,
         state::ThemeMode::Dark => egui::ThemePreference::Dark,
@@ -4169,7 +3843,7 @@ fn theme_preference(mode: state::ThemeMode) -> egui::ThemePreference {
 }
 
 /// The caption for one of the ways the list can be sorted.
-fn sort_option_label(sort: SortBy) -> &'static str {
+pub(crate) fn sort_option_label(sort: SortBy) -> &'static str {
     match sort {
         SortBy::Name => "名称 (A-Z)",
         SortBy::Updated => "最后更新",
@@ -4177,12 +3851,12 @@ fn sort_option_label(sort: SortBy) -> &'static str {
 }
 
 /// A one-pixel line in the given colour.
-fn line(color: Color32) -> Stroke {
+pub(crate) fn line(color: Color32) -> Stroke {
     Stroke::new(1.0, color)
 }
 
 /// The width of a piece of text, measured with the font it will be drawn in.
-fn measure(ui: &Ui, text: &str, font: egui::FontId) -> f32 {
+pub(crate) fn measure(ui: &Ui, text: &str, font: egui::FontId) -> f32 {
     ui.painter()
         .layout_no_wrap(text.to_string(), font, Color32::WHITE)
         .size()
@@ -4225,8 +3899,56 @@ fn main() -> eframe::Result<()> {
             // Draws the app's own icon once, without opening a window.
             "--make-icon" => {
                 if let Some(path) = args.next() {
-                    let image = render_icon(1024);
-                    write_png(std::path::Path::new(&path), &image);
+                    let image = app_icon::render_icon(1024);
+                    app_icon::write_png(std::path::Path::new(&path), &image);
+                    return Ok(());
+                }
+            }
+            // Checks one repository's newest release and downloads its
+            // asset, without opening a window: the command-line answer to
+            // "the list works but the download does not".
+            "--fetch-test" => {
+                if let Some(slug) = args.next() {
+                    match github::fetch_latest_release(&slug, false, None, None) {
+                        Ok(github::ReleaseFetch::Fresh { info: rel, .. }) => {
+                            println!("tag:      {}", rel.tag);
+                            match rel.asset {
+                                Some(asset) => {
+                                    println!("asset:    {} ({})", asset.name, human_size(asset.size));
+                                    println!("api url:  {}", asset.url);
+                                    println!("browser:  {}", asset.browser_url);
+                                    let dest =
+                                        std::env::temp_dir().join("gitup-fetch-test.bin");
+                                    let cancel = AtomicBool::new(false);
+                                    let started = std::time::Instant::now();
+                                    let got = github::download_file(
+                                        &[asset.url.clone(), asset.browser_url.clone()],
+                                        &dest,
+                                        None,
+                                        &cancel,
+                                        |_, _| {},
+                                    );
+                                    let bytes = std::fs::metadata(&dest)
+                                        .map(|m| m.len())
+                                        .unwrap_or(0);
+                                    let secs = started.elapsed().as_secs_f32().max(0.001);
+                                    match got {
+                                        Ok(()) => println!(
+                                            "download: ok, {bytes} bytes in {secs:.1}s ({})",
+                                            human_speed(bytes as f32 / secs)
+                                        ),
+                                        Err(e) => println!("download: failed — {e}"),
+                                    }
+                                    let _ = std::fs::remove_file(&dest);
+                                }
+                                None => println!("this release has no macOS asset"),
+                            }
+                        }
+                        Ok(github::ReleaseFetch::NotModified) => {
+                            println!("release:  304 not modified");
+                        }
+                        Err(e) => println!("release:  failed — {e}"),
+                    }
                     return Ok(());
                 }
             }
@@ -4288,6 +4010,7 @@ fn main() -> eframe::Result<()> {
                         inner: App {
                             launcher,
                             demo_applied: false,
+                            last_dark: None,
                         },
                         path,
                         frame: 0,
@@ -4304,6 +4027,7 @@ fn main() -> eframe::Result<()> {
                 None => Ok(Box::new(App {
                     launcher,
                     demo_applied: false,
+                    last_dark: None,
                 })),
             }
         }),
@@ -4413,6 +4137,30 @@ impl eframe::App for ScreenshotApp {
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        // A test hook: with GITUP_READD_TEST set, a built-in subscription is
+        // switched off and its address is added again, which must put it
+        // back on rather than answer "already subscribed".
+        if std::env::var("GITUP_READD_TEST").is_ok() && self.frame == 6 {
+            let idx = 2usize;
+            let slug = repos()[idx].slug.to_string();
+            let id = repos()[idx].id.to_string();
+            if !self
+                .inner
+                .launcher
+                .settings
+                .disabled
+                .iter()
+                .any(|d| d == &id)
+            {
+                self.inner.launcher.toggle_subscription(idx);
+            }
+            let off = self.inner.launcher.state.subscribed[idx];
+            let (added, known, bad) = self.inner.launcher.import_repositories(&slug);
+            let on = self.inner.launcher.state.subscribed[idx];
+            eprintln!(
+                "readd {slug}: subscribed_before_import={off} -> added={added} known={known} bad={bad} subscribed_now={on}"
+            );
+        }
         // A test hook: with GITUP_DEL_TEST set, a repository the person
         // added is removed on one frame, so a picture can show whether the
         // settings page stays where it is.
@@ -4488,7 +4236,7 @@ impl eframe::App for ScreenshotApp {
                     if shared.swap(true, std::sync::atomic::Ordering::SeqCst) {
                         return;
                     }
-                    write_png(&path, &image);
+                    app_icon::write_png(&path, &image);
                     std::process::exit(0);
                 });
             }
@@ -4500,277 +4248,3 @@ impl eframe::App for ScreenshotApp {
         ui.ctx().request_repaint();
     }
 }
-
-/// Draws the launcher's icon: a green rounded plate with the head of a
-/// bird in profile on it — white, black-outlined, hatched like an
-/// engraving, with a black eye and a white glint. Every edge is smoothed
-/// with four-by-four samples per pixel. Pixels are straight RGBA, which is
-/// what the PNG writer expects.
-fn render_icon(size: usize) -> egui::ColorImage {
-    let s = size as f32;
-    let inside_poly = |x: f32, y: f32, poly: &[(f32, f32)]| -> bool {
-        let mut inside = false;
-        let mut j = poly.len() - 1;
-        for i in 0..poly.len() {
-            let (xi, yi) = poly[i];
-            let (xj, yj) = poly[j];
-            if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
-                inside = !inside;
-            }
-            j = i;
-        }
-        inside
-    };
-    // The head and neck, facing right: crown, forehead, beak, throat, the
-    // notch under the beak, then straight down the front and the back.
-    let head: [(f32, f32); 13] = [
-        (0.130, 0.905), // neck, bottom left
-        (0.118, 0.330), // back of the head
-        (0.190, 0.140), // crown, rear
-        (0.320, 0.058), // crown
-        (0.480, 0.072), // brow
-        (0.600, 0.162), // forehead
-        (0.655, 0.278), // top of the beak
-        (0.905, 0.408), // beak, tip
-        (0.658, 0.472), // beak, underside
-        (0.612, 0.560), // cheek
-        (0.700, 0.678), // the notch at the throat
-        (0.636, 0.772),
-        (0.652, 0.905), // neck, bottom right
-    ];
-    // The bird sits a little inside the plate, so its outline never runs
-    // into the rounded edge.
-    let shrink = |p: (f32, f32)| -> (f32, f32) {
-        (0.5 + (p.0 - 0.5) * 0.80, 0.5 + (p.1 - 0.5) * 0.80)
-    };
-    let head = head.map(shrink);
-    // The engraved hatching across the neck and cheek.
-    let hatches: [(f32, f32, f32, f32); 11] = [
-        (0.200, 0.400, 0.268, 0.516),
-        (0.272, 0.362, 0.338, 0.478),
-        (0.342, 0.452, 0.408, 0.568),
-        (0.198, 0.556, 0.266, 0.672),
-        (0.280, 0.582, 0.348, 0.698),
-        (0.360, 0.622, 0.428, 0.738),
-        (0.222, 0.700, 0.290, 0.816),
-        (0.310, 0.742, 0.378, 0.858),
-        (0.420, 0.500, 0.482, 0.604),
-        (0.440, 0.660, 0.508, 0.776),
-        (0.498, 0.300, 0.556, 0.400),
-    ];
-    let hatches = hatches.map(|(x0, y0, x1, y1)| {
-        let a = shrink((x0, y0));
-        let b = shrink((x1, y1));
-        (a.0, a.1, b.0, b.1)
-    });
-    let eye = shrink((0.452, 0.252));
-    let glint = shrink((0.466, 0.238));
-    let dist_to_seg = |x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32| -> f32 {
-        let (dx, dy) = (x1 - x0, y1 - y0);
-        let len2 = dx * dx + dy * dy;
-        if len2 <= f32::EPSILON {
-            return ((x - x0).powi(2) + (y - y0).powi(2)).sqrt();
-        }
-        let t = (((x - x0) * dx + (y - y0) * dy) / len2).clamp(0.0, 1.0);
-        ((x - (x0 + t * dx)).powi(2) + (y - (y0 + t * dy)).powi(2)).sqrt()
-    };
-    // The plate's rounded rectangle, as a signed distance.
-    let plate_sd = |x: f32, y: f32| -> f32 {
-        let (hw, hh, r) = (0.455, 0.455, 0.225);
-        let qx = (x - 0.5).abs() - (hw - r);
-        let qy = (y - 0.5).abs() - (hh - r);
-        let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
-        outside + qx.max(qy).min(0.0) - r
-    };
-    // A white plate with a hairline rim, so the icon still reads on a
-    // white background; the bird keeps its black outline.
-    let top = (0.988f32, 0.988, 0.982);
-    let bottom = (0.957f32, 0.957, 0.949);
-    let paper = (0.973f32, 0.973, 0.961);
-    let ink = (0.075f32, 0.078, 0.082);
-    let outline_w = 0.0105;
-    let mut pixels = Vec::with_capacity(size * size);
-    const N: usize = 4;
-    for py in 0..size {
-        for pxi in 0..size {
-            let mut acc = [0.0f32; 4];
-            let mut acc_a = 0.0f32;
-            for sy in 0..N {
-                for sx in 0..N {
-                    let x = (pxi as f32 + (sx as f32 + 0.5) / N as f32) / s;
-                    let y = (py as f32 + (sy as f32 + 0.5) / N as f32) / s;
-                    let sd = plate_sd(x, y);
-                    if sd > 0.0 {
-                        acc_a += 1.0;
-                        continue;
-                    }
-                    // The plate: white, with a soft shadow towards the
-                    // bottom and a hairline rim just inside the edge.
-                    let t = y.clamp(0.0, 1.0);
-                    let mut c = if sd > -0.0038 {
-                        (0.878f32, 0.878, 0.870, 1.0)
-                    } else {
-                        (
-                            top.0 + (bottom.0 - top.0) * t,
-                            top.1 + (bottom.1 - top.1) * t,
-                            top.2 + (bottom.2 - top.2) * t,
-                            1.0,
-                        )
-                    };
-                    // The bird, then its outline and hatching on top.
-                    let near = x > 0.09 && x < 0.93 && y > 0.03 && y < 0.93;
-                    if near {
-                        let inside = inside_poly(x, y, &head);
-                        let mut edge = false;
-                        for i in 0..head.len() {
-                            let a = head[i];
-                            let b = head[(i + 1) % head.len()];
-                            if dist_to_seg(x, y, a.0, a.1, b.0, b.1) < outline_w {
-                                edge = true;
-                                break;
-                            }
-                        }
-                        if inside {
-                            c = (paper.0, paper.1, paper.2, 1.0);
-                        }
-                        // The eye: a black bead with a white glint.
-                        let de = ((x - eye.0).powi(2) + (y - eye.1).powi(2)).sqrt();
-                        if de < 0.0345 {
-                            c = (ink.0, ink.1, ink.2, 1.0);
-                        }
-                        let dg = ((x - glint.0).powi(2) + (y - glint.1).powi(2)).sqrt();
-                        if dg < 0.0100 {
-                            c = (paper.0, paper.1, paper.2, 1.0);
-                        }
-                        if inside {
-                            for (x0, y0, x1, y1) in hatches {
-                                if dist_to_seg(x, y, x0, y0, x1, y1) < 0.0058 {
-                                    c = (ink.0, ink.1, ink.2, 1.0);
-                                }
-                            }
-                        }
-                        if edge {
-                            c = (ink.0, ink.1, ink.2, 1.0);
-                        }
-                    }
-                    acc[0] += c.0 * c.3;
-                    acc[1] += c.1 * c.3;
-                    acc[2] += c.2 * c.3;
-                    acc[3] += c.3;
-                    acc_a += 1.0;
-                }
-            }
-            let a = acc_a.max(1.0);
-            let alpha = acc[3] / a;
-            pixels.push(if alpha <= 0.001 {
-                Color32::TRANSPARENT
-            } else {
-                let r = (acc[0] / acc[3]).clamp(0.0, 1.0);
-                let g = (acc[1] / acc[3]).clamp(0.0, 1.0);
-                let b = (acc[2] / acc[3]).clamp(0.0, 1.0);
-                Color32::from_rgba_unmultiplied(
-                    (r * 255.0).round() as u8,
-                    (g * 255.0).round() as u8,
-                    (b * 255.0).round() as u8,
-                    (alpha * 255.0).round() as u8,
-                )
-            });
-        }
-    }
-    egui::ColorImage {
-        size: [size, size],
-        pixels,
-        source_size: Vec2::new(size as f32, size as f32),
-    }
-}
-
-/// Writes a PNG without pulling in an image crate.
-fn write_png(path: &std::path::Path, image: &egui::ColorImage) {
-    let (w, h) = (image.width() as u32, image.height() as u32);
-    let mut raw = Vec::with_capacity((w * 4 + 1) as usize * h as usize);
-    for y in 0..h {
-        raw.push(0);
-        for x in 0..w {
-            let c = image[(x as usize, y as usize)];
-            // The stored bytes are straight (unmultiplied) RGBA.
-            let (r, g, b, a) = (c.r(), c.g(), c.b(), c.a());
-            let un = |v: u8| if a == 0 { 0 } else { ((v as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8 };
-            raw.extend_from_slice(&[un(r), un(g), un(b), a]);
-        }
-    }
-    let png = encode_png_rgba(w, h, &raw);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    // Write beside the target and move it into place in one step, so the
-    // watchdog never sees a half-written file.
-    let temp = path.with_extension("png.part");
-    if std::fs::write(&temp, &png).is_ok() {
-        let _ = std::fs::rename(&temp, path);
-        return;
-    }
-    let _ = std::fs::write(path, png);
-}
-
-fn encode_png_rgba(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
-    let mut ihdr = Vec::new();
-    ihdr.extend_from_slice(&w.to_be_bytes());
-    ihdr.extend_from_slice(&h.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-    chunk(&mut out, b"IHDR", &ihdr);
-    let compressed = zlib_stored(raw);
-    chunk(&mut out, b"IDAT", &compressed);
-    chunk(&mut out, b"IEND", &[]);
-    out
-}
-
-/// zlib stream using stored (uncompressed) deflate blocks. Valid, if bulky.
-fn zlib_stored(data: &[u8]) -> Vec<u8> {
-    let mut out = vec![0x78, 0x01];
-    let mut i = 0;
-    while i < data.len() {
-        let n = (data.len() - i).min(65535);
-        let last = i + n >= data.len();
-        out.push(if last { 1 } else { 0 });
-        out.extend_from_slice(&(n as u16).to_le_bytes());
-        out.extend_from_slice(&(!(n as u16)).to_le_bytes());
-        out.extend_from_slice(&data[i..i + n]);
-        i += n;
-    }
-    let (mut a, mut b) = (1u32, 0u32);
-    for &byte in data {
-        a = (a + byte as u32) % 65521;
-        b = (b + a) % 65521;
-    }
-    out.extend_from_slice(&((b << 16) | a).to_be_bytes());
-    out
-}
-
-fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    out.extend_from_slice(kind);
-    out.extend_from_slice(data);
-    let mut crc_input = Vec::with_capacity(4 + data.len());
-    crc_input.extend_from_slice(kind);
-    crc_input.extend_from_slice(data);
-    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut table = [0u32; 256];
-    for (i, slot) in table.iter_mut().enumerate() {
-        let mut c = i as u32;
-        for _ in 0..8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
-        }
-        *slot = c;
-    }
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    crc ^ 0xFFFF_FFFF
-}
-

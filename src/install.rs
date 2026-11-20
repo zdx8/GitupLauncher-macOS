@@ -1,14 +1,16 @@
 //! The local side: what is installed, opening it, and putting a fresh
-//! download into /Applications.
+//! download into the configured install directory.
 //!
-//! The Mac's own tools do the heavy lifting — PlistBuddy to read a
-//! bundle's version, ditto to unpack a zip and to copy a bundle without
-//! losing anything, hdiutil to mount a dmg — so nothing here depends on
-//! an unsigned helper or a third-party installer.
+//! Uses macOS built-in tools (`PlistBuddy`, `ditto`, `hdiutil`, `sips`,
+//! `osascript`). Each installation runs in its own isolated temp directory
+//! so concurrent downloads/installs never collide.
 
 use crate::github::AssetKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static INSTALL_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Run a command and hand back its stdout, or its stderr as the error.
 fn run(cmd: &mut Command) -> Result<String, String> {
@@ -22,21 +24,62 @@ fn run(cmd: &mut Command) -> Result<String, String> {
     }
 }
 
-/// Where app bundles are looked for.
-fn app_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from("/Applications")];
+/// Expand a leading `~` or `~/` in a user-configured path.
+pub fn expand_install_dir(install_dir: &str) -> PathBuf {
+    let trimmed = install_dir.trim();
+    if trimmed.is_empty() {
+        return PathBuf::from("/Applications");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if trimmed == "~" {
+            return PathBuf::from(home);
+        }
+        if let Some(rest) = trimmed.strip_prefix("~/") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
+/// Where app bundles are looked for: configured install dir first, then
+/// `/Applications` and `~/Applications` (deduplicated).
+fn app_dirs(install_dir: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut push_unique = |p: PathBuf| {
+        if !dirs.iter().any(|d| d == &p) {
+            dirs.push(p);
+        }
+    };
+    push_unique(expand_install_dir(install_dir));
+    push_unique(PathBuf::from("/Applications"));
     if let Ok(home) = std::env::var("HOME") {
         let dir = PathBuf::from(home).join("Applications");
         if dir.is_dir() {
-            dirs.push(dir);
+            push_unique(dir);
         }
     }
     dirs
 }
 
+/// Escape a string for safe embedding inside AppleScript double quotes.
+fn escape_applescript(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Gently ask a running app to quit before replacing or moving it to the Bin.
+fn quit_running_app(bundle: &str) {
+    let escaped = escape_applescript(bundle);
+    let script = format!(
+        "if application \"{escaped}\" is running then tell application \"{escaped}\" to quit"
+    );
+    if run(Command::new("osascript").arg("-e").arg(&script)).is_ok() {
+        std::thread::sleep(std::time::Duration::from_millis(350));
+    }
+}
+
 /// The version of the installed `<bundle>.app`, when it is on this Mac.
-pub fn installed_version(bundle: &str) -> Option<String> {
-    for dir in app_dirs() {
+pub fn installed_version(bundle: &str, install_dir: &str) -> Option<String> {
+    for dir in app_dirs(install_dir) {
         let plist = dir.join(format!("{bundle}.app/Contents/Info.plist"));
         if !plist.exists() {
             continue;
@@ -57,8 +100,8 @@ pub fn installed_version(bundle: &str) -> Option<String> {
 }
 
 /// Open the installed app, by path first and by name as a fallback.
-pub fn open_app(bundle: &str) -> Result<(), String> {
-    for dir in app_dirs() {
+pub fn open_app(bundle: &str, install_dir: &str) -> Result<(), String> {
+    for dir in app_dirs(install_dir) {
         let app = dir.join(format!("{bundle}.app"));
         if app.exists() {
             run(Command::new("open").arg(&app)).map(|_| ())?;
@@ -68,37 +111,64 @@ pub fn open_app(bundle: &str) -> Result<(), String> {
     run(Command::new("open").args(["-a", bundle])).map(|_| ())
 }
 
-/// Move the installed `<bundle>.app` to the Bin. The subscription is a
-/// setting inside the launcher, so it is untouched: the app goes, the entry
-/// stays, and it can be installed again from the same card.
-pub fn uninstall_app(bundle: &str) -> Result<(), String> {
-    for dir in app_dirs() {
+/// Move the installed `<bundle>.app` to the Bin.
+pub fn uninstall_app(bundle: &str, install_dir: &str) -> Result<(), String> {
+    for dir in app_dirs(install_dir) {
         let app = dir.join(format!("{bundle}.app"));
         if !app.exists() {
             continue;
         }
-        // Through the Finder, so the bundle lands in the Bin the way a
-        // person expects, and can be put back if they change their mind.
-        let script = format!(
-            "tell application \"Finder\" to delete POSIX file \"{}\"",
-            app.display()
-        );
+        quit_running_app(bundle);
+        let escaped = escape_applescript(&app.display().to_string());
+        let script = format!("tell application \"Finder\" to delete POSIX file \"{escaped}\"");
         run(Command::new("osascript").arg("-e").arg(&script))?;
         return Ok(());
     }
     Err("没有在本机找到该应用".to_string())
 }
 
-/// The installed app's own icon, turned into PNG bytes by sips. The name
-/// in the bundle's Info.plist may or may not carry the `.icns` suffix, so
-/// both spellings are tried; a bundle without an icon answers `None`.
-pub fn bundle_icon_png(bundle: &str) -> Option<Vec<u8>> {
-    for dir in app_dirs() {
-        let contents = dir.join(format!("{bundle}.app/Contents"));
+/// Directory for cached 256px PNG icons so startup doesn't re-run `sips`.
+fn icon_cache_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join("Library/Caches/GitupLauncher/icons")
+}
+
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The installed app's own icon, turned into PNG bytes by sips and cached on
+/// disk keyed by bundle mtime so subsequent launches load instantly.
+pub fn bundle_icon_png(bundle: &str, install_dir: &str) -> Option<Vec<u8>> {
+    for dir in app_dirs(install_dir) {
+        let app_dir = dir.join(format!("{bundle}.app"));
+        let contents = app_dir.join("Contents");
         let plist = contents.join("Info.plist");
         if !plist.exists() {
             continue;
         }
+        let mtime = std::fs::metadata(&plist)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let cache_dir = icon_cache_dir();
+        let cached_png = cache_dir.join(format!("{}-{mtime}.png", sanitize_filename(bundle)));
+        if let Ok(bytes) = std::fs::read(&cached_png) {
+            if !bytes.is_empty() {
+                return Some(bytes);
+            }
+        }
+
         let icon_name = run(Command::new("/usr/libexec/PlistBuddy")
             .arg("-c")
             .arg("Print :CFBundleIconFile")
@@ -115,14 +185,9 @@ pub fn bundle_icon_png(bundle: &str) -> Option<Vec<u8>> {
         if !icon.exists() {
             continue;
         }
-        // sips reads every icon format on the Mac and writes a 256-pixel
-        // PNG, which is plenty for the tiles. Its folder must exist
-        // first: without it, sips quietly writes somewhere else.
-        let dir = std::env::temp_dir().join("gitup-launcher/icons");
-        if std::fs::create_dir_all(&dir).is_err() {
+        if std::fs::create_dir_all(&cache_dir).is_err() {
             return None;
         }
-        let out = dir.join(format!("{bundle}.png"));
         let converted = run(
             Command::new("sips")
                 .arg("-s")
@@ -132,12 +197,12 @@ pub fn bundle_icon_png(bundle: &str) -> Option<Vec<u8>> {
                 .arg("256")
                 .arg(&icon)
                 .arg("--out")
-                .arg(&out),
+                .arg(&cached_png),
         );
         if converted.is_err() {
             continue;
         }
-        return std::fs::read(&out).ok();
+        return std::fs::read(&cached_png).ok();
     }
     None
 }
@@ -156,7 +221,11 @@ fn find_app(root: &Path, bundle: &str) -> Option<PathBuf> {
             }
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("app") {
-                if path.file_stem().and_then(|s| s.to_str()) == Some(bundle) {
+                if path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.eq_ignore_ascii_case(bundle))
+                {
                     return Some(path);
                 }
                 fallback.get_or_insert(path);
@@ -168,75 +237,109 @@ fn find_app(root: &Path, bundle: &str) -> Option<PathBuf> {
     fallback
 }
 
-/// Put the app inside a downloaded zip or dmg into /Applications, replacing
-/// the copy that is already there. The old copy is moved aside first and
-/// put back if anything goes wrong, so a half-done update never leaves the
-/// Mac without the app.
-pub fn install_asset(file: &Path, kind: AssetKind, bundle: &str) -> Result<(), String> {
-    let tmp = std::env::temp_dir().join("gitup-launcher/install");
-    let _ = std::fs::remove_dir_all(&tmp);
+/// Put the app inside a downloaded zip or dmg into the target folder,
+/// replacing any existing copy safely with rollback on failure.
+///
+/// Each invocation uses its own isolated temp directory so concurrent
+/// installations never interfere with one another. Returns the actual
+/// installed bundle stem (without `.app`).
+pub fn install_asset(
+    file: &Path,
+    kind: AssetKind,
+    expected_bundle: &str,
+    install_dir: &str,
+    preserve_archive_name: bool,
+) -> Result<String, String> {
+    let seq = INSTALL_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir()
+        .join("gitup-launcher/install")
+        .join(format!("{}-{seq}-{nanos}", sanitize_filename(expected_bundle)));
     std::fs::create_dir_all(&tmp).map_err(|e| format!("无法创建临时目录: {e}"))?;
 
     let mut mount: Option<PathBuf> = None;
-    let src_app = match kind {
-        AssetKind::Zip => {
-            let out = tmp.join("unzipped");
-            std::fs::create_dir_all(&out).map_err(|e| format!("{e}"))?;
-            let unzip = run(Command::new("ditto").arg("-x").arg("-k").arg(file).arg(&out));
-            if let Err(e) = unzip {
-                return Err(format!("解压失败: {e}"));
-            }
-            match find_app(&out, bundle) {
-                Some(app) => app,
-                None => return Err("安装包里没有找到 .app".to_string()),
-            }
-        }
-        AssetKind::Dmg => {
-            let mnt = tmp.join("mnt");
-            std::fs::create_dir_all(&mnt).map_err(|e| format!("{e}"))?;
-            let attach = run(
-                Command::new("hdiutil")
-                    .arg("attach")
-                    .arg("-nobrowse")
-                    .arg("-readonly")
-                    .arg("-mountpoint")
-                    .arg(&mnt)
-                    .arg(file),
-            );
-            if let Err(e) = attach {
-                return Err(format!("挂载安装包失败: {e}"));
-            }
-            mount = Some(mnt.clone());
-            match find_app(&mnt, bundle) {
-                Some(app) => app,
-                None => {
-                    let _ = run(Command::new("hdiutil").arg("detach").arg(&mnt));
-                    return Err("安装包里没有找到 .app".to_string());
+    let result = (|| -> Result<String, String> {
+        let src_app = match kind {
+            AssetKind::Zip => {
+                let out = tmp.join("unzipped");
+                std::fs::create_dir_all(&out).map_err(|e| format!("{e}"))?;
+                let unzip = run(Command::new("ditto").arg("-x").arg("-k").arg(file).arg(&out));
+                if let Err(e) = unzip {
+                    return Err(format!("解压失败: {e}"));
                 }
+                find_app(&out, expected_bundle)
+                    .ok_or_else(|| "安装包里没有找到 .app".to_string())?
+            }
+            AssetKind::Dmg => {
+                let mnt = tmp.join("mnt");
+                std::fs::create_dir_all(&mnt).map_err(|e| format!("{e}"))?;
+                let attach = run(
+                    Command::new("hdiutil")
+                        .arg("attach")
+                        .arg("-nobrowse")
+                        .arg("-readonly")
+                        .arg("-mountpoint")
+                        .arg(&mnt)
+                        .arg(file),
+                );
+                if let Err(e) = attach {
+                    return Err(format!("挂载安装包失败: {e}"));
+                }
+                mount = Some(mnt.clone());
+                find_app(&mnt, expected_bundle)
+                    .ok_or_else(|| "安装包里没有找到 .app".to_string())?
+            }
+        };
+
+        let actual_bundle = if preserve_archive_name || expected_bundle.is_empty() {
+            src_app
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(expected_bundle)
+                .to_string()
+        } else {
+            expected_bundle.to_string()
+        };
+
+        // Keep existing location when updating; otherwise install to `install_dir`.
+        let target_dir = app_dirs(install_dir)
+            .into_iter()
+            .find(|d| d.join(format!("{actual_bundle}.app")).exists())
+            .unwrap_or_else(|| expand_install_dir(install_dir));
+        if !target_dir.exists() {
+            std::fs::create_dir_all(&target_dir)
+                .map_err(|e| format!("无法创建安装目录 {}: {e}", target_dir.display()))?;
+        }
+
+        let dst = target_dir.join(format!("{actual_bundle}.app"));
+        let backup = tmp.join("old.app");
+        let had_old = dst.exists();
+        if had_old {
+            quit_running_app(&actual_bundle);
+            std::fs::rename(&dst, &backup).map_err(|e| format!("无法移开旧版本: {e}"))?;
+        }
+        let copied = run(Command::new("ditto").arg(&src_app).arg(&dst));
+        match copied {
+            Ok(_) => {
+                let _ = run(Command::new("xattr").args(["-cr"]).arg(&dst));
+                Ok(actual_bundle)
+            }
+            Err(e) => {
+                if had_old {
+                    let _ = std::fs::rename(&backup, &dst);
+                }
+                Err(format!("拷贝到 {} 失败: {e}", target_dir.display()))
             }
         }
-    };
+    })();
 
-    let dst = PathBuf::from("/Applications").join(format!("{bundle}.app"));
-    let backup = tmp.join("old.app");
-    let had_old = dst.exists();
-    if had_old {
-        std::fs::rename(&dst, &backup).map_err(|e| format!("无法移开旧版本: {e}"))?;
-    }
-    let copied = run(Command::new("ditto").arg(&src_app).arg(&dst));
     if let Some(m) = &mount {
         let _ = run(Command::new("hdiutil").arg("detach").arg(m));
     }
-    match copied {
-        Ok(_) => {
-            let _ = std::fs::remove_dir_all(&backup);
-            Ok(())
-        }
-        Err(e) => {
-            if had_old {
-                let _ = std::fs::rename(&backup, &dst);
-            }
-            Err(format!("拷贝到 /Applications 失败: {e}"))
-        }
-    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
 }

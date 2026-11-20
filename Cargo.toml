@@ -1,6 +1,6 @@
 [package]
 name = "gitup-launcher"
-version = "0.3.9"
+version = "0.4.0"
 edition = "2021"
 description = "A small launcher that installs, updates and opens the apps published on GitHub Releases."
 
@@ -17,8 +17,6 @@ eframe = { version = "0.37", default-features = false, features = [
     "default_fonts",
     "glow",
     "system_fonts",
-    "wayland",
-    "x11",
 ] }
 egui = "0.37"
 egui_system_font_provider = "0.37"
