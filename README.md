@@ -9,8 +9,8 @@ window — no browser, no dragging DMGs around.
 
 ## Install
 
-Download `GitupLauncher-v<version>-arm64.zip` from
-[Releases](../../releases), unzip it, and drag **Gitup Launcher.app**
+Download `GitupLauncher-macOS-arm64.dmg` from
+[Releases](../../releases), open it, and drag **Gitup Launcher.app**
 into `/Applications`.
 
 The build is signed ad-hoc rather than with an Apple Developer ID, so the
@@ -64,7 +64,8 @@ window; dragging the background moves it.
 - **One app's page** – the release history, the changelog, and arrows
   that step through the other subscriptions.
 - **Settings** – appearance, when to check for updates, where installs
-  go, and the list of subscriptions with an × to drop one.
+  go, an optional GitHub token, and the list of subscriptions with an ×
+  to drop one.
 
 Versions, dates and download links come live from the GitHub Releases
 API on worker threads, so the window never waits on the network. What is
@@ -74,14 +75,22 @@ dmg), unpacks it with ditto or mounts it with hdiutil, and replaces the
 copy in the install folder — moving the old one aside first and putting
 it back if anything fails. Clicking a running download cancels it.
 
+## Updating itself
+
+The launcher reads its own releases from `zdx8/GitupLauncher-macOS` too.
+When a newer version is published, the top bar offers it: the download
+runs in the background, the new bundle is staged next to the old one, and
+a small helper swaps it in and reopens the app once the current process
+has quit. Nothing is replaced while the app is still running, and the
+previous bundle is restored if the copy fails.
+
 ## Rate limits
 
 The GitHub API allows 60 anonymous requests an hour, which is only a few
-refreshes. Set a token to raise that to 5000:
-
-```sh
-GITHUB_TOKEN=ghp_xxx ./target/release/gitup-launcher
-```
+refreshes. A token raises that to 5000: paste one under
+**Settings → GitHub Token** (it is stored only in
+`~/Library/Application Support/GitupLauncher/settings.json`, readable by
+your account alone), or set `GITHUB_TOKEN` before launching.
 
 ## Looking at the other screens
 

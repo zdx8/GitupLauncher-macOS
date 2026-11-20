@@ -2,25 +2,41 @@
 //! of its assets with progress.
 //!
 //! Everything here runs on worker threads and reports back through a
-//! channel, so the window never waits on the network. A `GITHUB_TOKEN`
-//! environment variable, when set, is used for the API calls; without it
-//! GitHub allows 60 an hour from one address, which is plenty for eight
-//! repositories.
+//! channel, so the window never waits on the network. A shared `ureq::Agent`
+//! reuses TLS/HTTP keep-alive connections, and `ETag` / `If-None-Match`
+//! avoids burning the 60 req/hr anonymous quota when nothing changed.
 
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 pub const UA: &str = concat!("GitupLauncher/", env!("CARGO_PKG_VERSION"));
 
-/// One agent per process is fine; it keeps the connections warm.
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        .try_proxy_from_env(true)
-        .build()
+static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+/// One shared agent per process to reuse keep-alive connections.
+fn agent() -> &'static ureq::Agent {
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(15))
+            .timeout_read(Duration::from_secs(30))
+            .try_proxy_from_env(true)
+            .build()
+    })
+}
+
+/// Prefer a user-configured token from Settings, falling back to `GITHUB_TOKEN`.
+fn effective_token(token: Option<&str>) -> Option<String> {
+    if let Some(t) = token.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(t.to_string());
+    }
+    std::env::var("GITHUB_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,19 +55,27 @@ pub struct MacAsset {
     /// touches github.com — the host that is the first to go missing on
     /// a network where the API still answers.
     pub url: String,
-    /// The link a browser would use, kept as a second chance and for the
-    /// day a page wants to offer it.
+    /// The link a browser would use, kept as a second chance.
     pub browser_url: String,
-    /// Kept for the day the button wants to say how big the download is.
     #[allow(dead_code)]
     pub size: u64,
     pub kind: AssetKind,
 }
 
+/// Result of a conditional `fetch_latest_release` call.
+pub enum ReleaseFetch {
+    /// New release payload arrived from GitHub (with optional ETag for future 304s).
+    Fresh {
+        info: ReleaseInfo,
+        etag: Option<String>,
+    },
+    /// GitHub returned `304 Not Modified` — cached release is still current
+    /// and this request did not count against the rate limit.
+    NotModified,
+}
+
 /// The release as plain JSON, so it can be kept on disk and shown again
-/// when GitHub cannot be asked (the anonymous API allows sixty calls an
-/// hour, and a launcher that loses its version numbers when that runs out
-/// is no use).
+/// when GitHub cannot be asked.
 pub fn to_json(rel: &ReleaseInfo) -> Value {
     let asset = rel.asset.as_ref().map(|a| {
         serde_json::json!({
@@ -79,8 +103,6 @@ pub fn from_json(v: &Value) -> Option<ReleaseInfo> {
     let tag = v["tag"].as_str()?.to_string();
     let asset = v.get("asset").and_then(|a| {
         let url = a["url"].as_str()?.to_string();
-        // Caches written before the two links were kept apart have only
-        // the browser one, which still works on most networks.
         let browser_url = a["browser"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -122,18 +144,20 @@ pub struct ReleaseInfo {
 }
 
 /// The best macOS asset of a release: `None` when there is none.
-///
-/// Windows and Linux builds, checksums and signature files are skipped;
-/// arm64 beats universal beats a plain build, and a zip is preferred over
-/// a dmg at the same tier because it installs without a mount.
 fn pick_mac_asset(assets: &[Value]) -> Option<MacAsset> {
     let mut best: Option<(i32, MacAsset)> = None;
     for a in assets {
         let Some(name) = a["name"].as_str() else { continue };
         let lower = name.to_lowercase();
-        if lower.contains("windows") || lower.contains("linux") || lower.contains("sha256")
-            || lower.contains("checksum") || lower.ends_with(".txt") || lower.ends_with(".json")
-            || lower.ends_with(".sig") || lower.ends_with(".exe") || lower.ends_with(".part")
+        if lower.contains("windows")
+            || lower.contains("linux")
+            || lower.contains("sha256")
+            || lower.contains("checksum")
+            || lower.ends_with(".txt")
+            || lower.ends_with(".json")
+            || lower.ends_with(".sig")
+            || lower.ends_with(".exe")
+            || lower.ends_with(".part")
         {
             continue;
         }
@@ -160,8 +184,6 @@ fn pick_mac_asset(assets: &[Value]) -> Option<MacAsset> {
         if browser_url.is_empty() {
             continue;
         }
-        // The API's own link first: it redirects to the file store without
-        // asking github.com, which is the host that fails first.
         let api_url = a["url"].as_str().unwrap_or_default();
         let url = if api_url.is_empty() {
             browser_url.to_string()
@@ -184,27 +206,39 @@ fn pick_mac_asset(assets: &[Value]) -> Option<MacAsset> {
     best.map(|(_, a)| a)
 }
 
-/// The newest release of `owner/repo` that carries something the Mac can
-/// install. Repositories that ship their Mac build under its own tag —
-/// `v2.3.0-macos` beside a Windows `v2.3.0`, say — are handled because
-/// the releases with nothing to install are simply skipped.
-/// The raw JSON of a repository's releases, newest first.
-fn releases_json(slug: &str, per_page: usize) -> Result<Vec<Value>, String> {
+enum ReleasesRaw {
+    NotModified,
+    Data(Vec<Value>, Option<String>),
+}
+
+/// The raw JSON of a repository's releases, newest first, with optional ETag support.
+fn releases_json(
+    slug: &str,
+    per_page: usize,
+    etag: Option<&str>,
+    token: Option<&str>,
+) -> Result<ReleasesRaw, String> {
     let url = format!("https://api.github.com/repos/{slug}/releases?per_page={per_page}");
     let mut req = agent()
         .get(&url)
         .set("User-Agent", UA)
         .set("Accept", "application/vnd.github+json");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.trim().is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", token.trim()));
-        }
+    if let Some(t) = effective_token(token) {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    if let Some(tag) = etag.map(str::trim).filter(|s| !s.is_empty()) {
+        req = req.set("If-None-Match", tag);
     }
     let resp = req.timeout(Duration::from_secs(30)).call().map_err(|e| match e {
         ureq::Error::Status(404, _) => "仓库不存在".to_string(),
-        ureq::Error::Status(403, _) => "GitHub API 限流，请稍后再试".to_string(),
+        ureq::Error::Status(401, _) => "GitHub Token 无效，请在设置中检查".to_string(),
+        ureq::Error::Status(403, _) => "GitHub API 限流，请在设置中配置 Token 或稍后再试".to_string(),
         other => format!("{other}"),
     })?;
+    if resp.status() == 304 {
+        return Ok(ReleasesRaw::NotModified);
+    }
+    let new_etag = resp.header("ETag").map(str::to_string);
     let v: Value = resp
         .into_json()
         .map_err(|e| format!("GitHub 返回了无法解析的内容: {e}"))?;
@@ -214,11 +248,10 @@ fn releases_json(slug: &str, per_page: usize) -> Result<Vec<Value>, String> {
     if arr.is_empty() {
         return Err("该仓库还没有发布任何版本".to_string());
     }
-    Ok(arr.clone())
+    Ok(ReleasesRaw::Data(arr.clone(), new_etag))
 }
 
-/// One release, read out of the API's JSON. `None` for drafts, and for
-/// prereleases when they are not wanted.
+/// One release, read out of the API's JSON.
 fn release_from_json(rel: &Value, include_pre: bool) -> Option<ReleaseInfo> {
     if rel["draft"].as_bool().unwrap_or(true) {
         return None;
@@ -242,23 +275,39 @@ fn release_from_json(rel: &Value, include_pre: bool) -> Option<ReleaseInfo> {
     })
 }
 
-pub fn fetch_latest_release(slug: &str, include_pre: bool) -> Result<ReleaseInfo, String> {
-    let arr = releases_json(slug, 15)?;
-    for rel in &arr {
-        if let Some(info) = release_from_json(rel, include_pre) {
-            if info.asset.is_some() {
-                return Ok(info);
+pub fn fetch_latest_release(
+    slug: &str,
+    include_pre: bool,
+    etag: Option<&str>,
+    token: Option<&str>,
+) -> Result<ReleaseFetch, String> {
+    match releases_json(slug, 15, etag, token)? {
+        ReleasesRaw::NotModified => Ok(ReleaseFetch::NotModified),
+        ReleasesRaw::Data(arr, new_etag) => {
+            for rel in &arr {
+                if let Some(info) = release_from_json(rel, include_pre) {
+                    if info.asset.is_some() {
+                        return Ok(ReleaseFetch::Fresh {
+                            info,
+                            etag: new_etag,
+                        });
+                    }
+                }
             }
+            Err("最新的发布里没有 macOS 安装包".to_string())
         }
     }
-    Err("最新的发布里没有 macOS 安装包".to_string())
 }
 
-/// Every published release, newest first, for the version picker. Releases
-/// without a Mac asset are kept, with `asset` empty, so the list still
-/// reads as a history.
-pub fn fetch_release_list(slug: &str, include_pre: bool) -> Result<Vec<ReleaseInfo>, String> {
-    let arr = releases_json(slug, 30)?;
+/// Every published release, newest first, for the version picker.
+pub fn fetch_release_list(
+    slug: &str,
+    include_pre: bool,
+    token: Option<&str>,
+) -> Result<Vec<ReleaseInfo>, String> {
+    let ReleasesRaw::Data(arr, _) = releases_json(slug, 30, None, token)? else {
+        return Err("没有获取到版本列表".to_string());
+    };
     let list: Vec<ReleaseInfo> = arr
         .iter()
         .filter_map(|rel| release_from_json(rel, include_pre))
@@ -269,9 +318,7 @@ pub fn fetch_release_list(slug: &str, include_pre: bool) -> Result<Vec<ReleaseIn
     Ok(list)
 }
 
-/// The release notes as a list of changes for the detail page. Bullet
-/// lines are kept one per entry; a release without any gets its opening
-/// paragraph instead, so the page never reads empty.
+/// The release notes as a list of changes for the detail page.
 pub fn changelog_lines(body: &str) -> Vec<String> {
     let clean = |line: &str| -> Option<String> {
         let t = line.trim();
@@ -291,7 +338,6 @@ pub fn changelog_lines(body: &str) -> Vec<String> {
     if !bullets.is_empty() {
         return bullets;
     }
-    // No bullets: the first few plain sentences stand in for them.
     let mut summary: Vec<String> = Vec::new();
     for line in body.lines() {
         let t = line.trim();
@@ -309,25 +355,26 @@ pub fn changelog_lines(body: &str) -> Vec<String> {
     }
     if summary.len() == 1 {
         let long = summary.remove(0);
-        summary.extend(long.split("。").map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string() + "。"));
+        summary.extend(
+            long.split('。')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string() + "。"),
+        );
         summary.truncate(4);
     }
     summary
 }
 
-/// The repository's own one-line description, when it has one. This is
-/// what the cards show under the name: Chinese when the repository
-/// writes one, whatever language it uses otherwise.
-pub fn fetch_repo_description(slug: &str) -> Option<String> {
+/// The repository's own one-line description, when it has one.
+pub fn fetch_repo_description(slug: &str, token: Option<&str>) -> Option<String> {
     let url = format!("https://api.github.com/repos/{slug}");
     let mut req = agent()
         .get(&url)
         .set("User-Agent", UA)
         .set("Accept", "application/vnd.github+json");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.trim().is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", token.trim()));
-        }
+    if let Some(t) = effective_token(token) {
+        req = req.set("Authorization", &format!("Bearer {t}"));
     }
     let resp = req.timeout(Duration::from_secs(20)).call().ok()?;
     let v: Value = resp.into_json().ok()?;
@@ -335,24 +382,18 @@ pub fn fetch_repo_description(slug: &str) -> Option<String> {
     Some(text)
 }
 
-/// Stream a file to `dest`, calling `progress` with the bytes moved so far
-/// and the total when it is known. Sets the error string to "cancelled"
-/// when `cancel` was raised; the part-file is removed in that case.
-///
-/// The addresses are tried in turn, so a file can be fetched from the API
-/// endpoint when the browser link is unreachable, or the other way round.
+/// Stream a file to `dest`, calling `progress` with bytes moved so far and total.
 pub fn download_file(
     urls: &[String],
     dest: &Path,
+    token: Option<&str>,
     cancel: &AtomicBool,
     progress: impl Fn(u64, u64),
 ) -> Result<(), String> {
     let mut last = "没有可用的下载地址".to_string();
     for url in urls {
-        match download_one(url, dest, cancel, &progress) {
+        match download_one(url, dest, token, cancel, &progress) {
             Ok(()) => return Ok(()),
-            // A cancelled download is the person's own doing; trying the
-            // next address would ignore that.
             Err(e) if e == "cancelled" => return Err(e),
             Err(e) => last = e,
         }
@@ -363,19 +404,16 @@ pub fn download_file(
 fn download_one(
     url: &str,
     dest: &Path,
+    token: Option<&str>,
     cancel: &AtomicBool,
     progress: &impl Fn(u64, u64),
 ) -> Result<(), String> {
     let mut req = agent()
         .get(url)
         .set("User-Agent", UA)
-        // Asking for the bytes themselves makes the API answer with a
-        // redirect to the file rather than JSON about it.
         .set("Accept", "application/octet-stream");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.trim().is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", token.trim()));
-        }
+    if let Some(t) = effective_token(token) {
+        req = req.set("Authorization", &format!("Bearer {t}"));
     }
     let resp = req.call().map_err(|e| format!("{e}"))?;
     let total: u64 = resp
