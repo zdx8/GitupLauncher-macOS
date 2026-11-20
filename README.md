@@ -1,101 +1,83 @@
 # Gitup Launcher
 
-A small macOS launcher for the apps a handful of GitHub repositories
-publish on Releases. It shows what is installed, reads each repository's
-newest release, and installs, updates or opens any of them from one
-window — no browser, no dragging DMGs around.
+一个小的 macOS 启动器，用来管理若干 GitHub 仓库发布在 Releases 里的应用。
+它会显示哪些已经装好、读取每个仓库的最新发布，并在同一个窗口里完成安装、
+更新或打开——不用开浏览器，也不用拖 DMG。
 
-![The launcher](docs/screenshot.png)
+![界面](docs/screenshot.png)
 
-## Install
+## 安装
 
-Download `GitupLauncher-macOS-arm64.dmg` from
-[Releases](../../releases), open it, and drag **Gitup Launcher.app**
-into `/Applications`.
+到 [Releases](../../releases) 下载 `GitupLauncher-macOS-arm64.dmg`，打开后把
+**Gitup Launcher.app** 拖进 `/Applications`。
 
-The build is signed ad-hoc rather than with an Apple Developer ID, so the
-first launch needs the usual macOS move: right-click the app and choose
-**Open**, or clear the quarantine flag yourself:
+这个包用的是 ad-hoc 签名，没有 Apple Developer ID，所以首次启动要走 macOS 的
+老规矩：右键点应用，选 **打开**；或者自己清掉隔离标记：
 
 ```sh
 xattr -dr com.apple.quarantine "/Applications/Gitup Launcher.app"
 ```
 
-Requires macOS 11 or newer on Apple silicon.
+需要 macOS 11 或更新版本，Apple 芯片。
 
-## Build it
+## 自己构建
 
 ```sh
 ./bundle.sh
 ```
 
-That builds the program and refreshes `Gitup Launcher.app` next to it.
-A Rust toolchain (1.85 or newer) and the Xcode command line tools are
-enough; there are no other build steps.
+它会编译程序，并在同目录刷新 `Gitup Launcher.app`。只需要 Rust 工具链
+（1.85 或更新）和 Xcode 命令行工具，没有别的步骤。
 
-## The repositories it watches
+## 默认关注的仓库
 
 - zdx8/NetScope-macOS · zdx8/iTelly-macOS · zdx8/MediaCurator-macOS
 - zdx8/SyncEngine-macOS · zdx8/DataCopier-macOS · zdx8/FTPServer-macOS
 - hety0211/lumen-raw · JamesQiu2005/SpektraLab
 
-More can be added with the toolbar's **添加订阅** button: paste one
-`owner/repo` or a full GitHub link, or press **批量添加** and give it one
-per line. Subscriptions can be removed again from the settings page.
+更多仓库可以用工具栏的 **添加订阅** 加进来：粘贴一个 `owner/repo` 或完整的
+GitHub 链接，或者点 **批量添加** 一次一行地填。订阅也可以在设置页里删掉。
 
-## What it does
+## 功能
 
-The window follows the Mac's own light or dark setting. The layout is
-anchored to the window's live edges, so it holds at any size, and the
-grid scrolls for real (wheel, thumb drag, or clicking the track) when
-the cards outgrow the window. Double-clicking the top bar zooms the
-window; dragging the background moves it.
+窗口跟随系统的浅色／深色设置。布局贴着窗口的实时边缘计算，所以任意尺寸都
+正常；卡片多到装不下时，网格是真滚动（滚轮、拖滑块、点轨道都行）。双击顶栏
+缩放窗口，拖背景移动窗口。
 
-- **Toolbar** – **添加订阅** and **刷新订阅** on the left; a sort menu,
-  a search box that narrows the list as you type, and a switch between
-  the card grid and a plain list on the right.
-- **The grid** – one card per app: its tile, name, publisher, the
-  release's version and date, one line about what it is for, and a
-  single button that reads **打开** when the app is here, **安装** when
-  it is not, and **更新** when a newer release is waiting. Apps that are
-  not installed yet sit under a 未安装 heading, dimmed.
-- **The card menu** – GitHub 仓库, 更新说明, 所有版本, 选择版本 (install
-  any earlier release), then 卸载软件 and 删除订阅.
-- **One app's page** – the release history, the changelog, and arrows
-  that step through the other subscriptions.
-- **Settings** – appearance, when to check for updates, where installs
-  go, an optional GitHub token, and the list of subscriptions with an ×
-  to drop one.
+- **工具栏** —— 左边是 **添加订阅** 和 **刷新订阅**；右边是排序菜单、一个
+  输入即过滤的搜索框，以及卡片网格／列表的切换。
+- **网格** —— 每个应用一张卡片：图标、名称、发布者、该版本的版本号与日期、
+  一句用途说明，以及一个按钮：已装好时显示 **打开**，没装时显示 **安装**，
+  有更新时显示 **更新**。尚未安装的应用会放在「未安装」标题下，颜色压暗。
+- **卡片菜单** —— GitHub 仓库、更新说明、所有版本、选择版本（可安装任意历史
+  版本），然后是卸载软件和删除订阅。
+- **单个应用的详情页** —— 发布历史、更新日志，以及用来在其它订阅之间前后
+  翻页的箭头。
+- **设置** —— 外观、检查更新的时机、安装位置、可选的 GitHub Token，以及带
+  × 的订阅列表，用来退订。
 
-Versions, dates and download links come live from the GitHub Releases
-API on worker threads, so the window never waits on the network. What is
-installed is read from each app bundle's own Info.plist. Installing
-downloads the release's macOS asset (arm64 first, then universal; zip or
-dmg), unpacks it with ditto or mounts it with hdiutil, and replaces the
-copy in the install folder — moving the old one aside first and putting
-it back if anything fails. Clicking a running download cancels it.
+版本号、日期和下载链接都由后台线程实时从 GitHub Releases API 取，窗口不会等
+网络。已安装的版本读自各应用自己的 Info.plist。安装时会下载该发布的 macOS
+资产（优先 arm64，其次 universal；zip 或 dmg），用 ditto 解包或用 hdiutil
+挂载，再替换安装目录里的那一份——先把它挪开，中途任何一步失败就放回去。
+下载过程中点一下可以取消。
 
-## Updating itself
+## 自我更新
 
-The launcher reads its own releases from `zdx8/GitupLauncher-macOS` too.
-When a newer version is published, the top bar offers it: the download
-runs in the background, the new bundle is staged next to the old one, and
-a small helper swaps it in and reopens the app once the current process
-has quit. Nothing is replaced while the app is still running, and the
-previous bundle is restored if the copy fails.
+启动器也从 `zdx8/GitupLauncher-macOS` 读自己的发布。发了新版本后顶栏会提示：
+下载在后台跑，新包先落在旧包旁边，等当前进程退出后由一个小的辅助脚本换上去
+并重新打开应用。应用还在运行时不会替换任何东西，拷贝失败则回滚到上一个包。
 
-## Rate limits
+## 请求额度
 
-The GitHub API allows 60 anonymous requests an hour, which is only a few
-refreshes. A token raises that to 5000: paste one under
-**Settings → GitHub Token** (it is stored only in
-`~/Library/Application Support/GitupLauncher/settings.json`, readable by
-your account alone), or set `GITHUB_TOKEN` before launching.
+GitHub API 匿名每小时只给 60 次，刷新几次就没了。填一个 Token 能提到 5000：
+在 **设置 → GitHub Token** 里粘贴（只保存在
+`~/Library/Application Support/GitupLauncher/settings.json`，仅你的账户可读），
+或者在启动前设置 `GITHUB_TOKEN` 环境变量。
 
-## Looking at the other screens
+## 直接看其它界面
 
-The program can open straight onto one of its views, which is handy for
-taking pictures of them:
+程序可以启动时直接打开某个视图，用来截图很方便：
 
 ```sh
 ./target/release/gitup-launcher --demo list
@@ -103,11 +85,10 @@ taking pictures of them:
 ./target/release/gitup-launcher --demo settings
 ```
 
-Setting `GITUP_THEME=light` (or `dark`) shows the other appearance, and
-adding `--screenshot some-file.png` saves a picture of the window and
-quits.
+设置 `GITUP_THEME=light`（或 `dark`）可以切到另一套外观，再加
+`--screenshot some-file.png` 会把窗口存成图片然后退出。
 
-## License
+## 许可证
 
-MIT — see [LICENSE](LICENSE). The bundled typefaces are under the SIL
-Open Font License; see [NOTICE.md](NOTICE.md).
+MIT —— 见 [LICENSE](LICENSE)。内置字体使用 SIL Open Font License，
+见 [NOTICE.md](NOTICE.md)。
