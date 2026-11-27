@@ -163,12 +163,17 @@ impl State {
     }
 
     /// Read the installed versions off this Mac. Local and quick, so it
-    /// runs on the window's own thread.
+    /// runs on the window's own thread. Uses each repo's slug so a renamed
+    /// `.app` (subscription name ≠ folder name) still counts as installed.
     pub fn rescan_installed(&mut self, install_dir: &str, overrides: &BTreeMap<String, String>) {
         for (i, repo) in catalog::repos().iter().enumerate() {
             if i < self.repos.len() {
                 let bundle = effective_bundle(repo.slug, repo.bundle, overrides);
-                self.repos[i].installed = crate::install::installed_version(bundle, install_dir);
+                self.repos[i].installed = crate::install::installed_version_for(
+                    bundle,
+                    install_dir,
+                    Some(repo.slug),
+                );
             }
         }
     }

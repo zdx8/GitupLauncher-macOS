@@ -62,7 +62,17 @@ impl PartialOrd for Version {
 fn is_platform_suffix(s: &str) -> bool {
     matches!(
         s,
-        "macos" | "mac" | "darwin" | "arm64" | "universal" | "x86_64" | "osx" | "apple"
+        "macos"
+            | "mac"
+            | "darwin"
+            | "arm64"
+            | "aarch64"
+            | "universal"
+            | "x86_64"
+            | "amd64"
+            | "x64"
+            | "osx"
+            | "apple"
     )
 }
 

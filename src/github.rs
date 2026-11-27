@@ -143,24 +143,88 @@ pub struct ReleaseInfo {
     pub asset: Option<MacAsset>,
 }
 
+/// True when the file name looks like an Intel-only Mac build (not universal).
+fn is_intel_only(lower: &str) -> bool {
+    let has_intel = lower.contains("x86_64")
+        || lower.contains("amd64")
+        || lower.contains("_x64")
+        || lower.contains("-x64")
+        || lower.contains(".x64")
+        || lower.contains("x64.");
+    let has_arm = lower.contains("arm64") || lower.contains("aarch64");
+    let universal = lower.contains("universal");
+    has_intel && !has_arm && !universal
+}
+
+/// True when the file name looks like an Apple Silicon build.
+fn is_apple_silicon(lower: &str) -> bool {
+    (lower.contains("arm64") || lower.contains("aarch64"))
+        && !lower.contains("x86_64")
+        && !is_intel_only(lower)
+}
+
+/// Score one release asset for installing on Apple Silicon. Higher is better;
+/// negative means "skip".
+fn score_mac_asset(lower: &str, kind: AssetKind) -> i32 {
+    if lower.contains("windows")
+        || lower.contains("linux")
+        || lower.contains("android")
+        || lower.contains("sha256")
+        || lower.contains("checksum")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".json")
+        || lower.ends_with(".sig")
+        || lower.ends_with(".exe")
+        || lower.ends_with(".msi")
+        || lower.ends_with(".apk")
+        || lower.ends_with(".deb")
+        || lower.ends_with(".rpm")
+        || lower.ends_with(".appimage")
+        || lower.ends_with(".part")
+    {
+        return -1;
+    }
+
+    let mut score = if is_apple_silicon(lower) {
+        40
+    } else if lower.contains("universal") {
+        30
+    } else if lower.contains("macos")
+        || lower.contains("darwin")
+        || lower.contains("-mac")
+        || lower.contains("_mac")
+        || lower.contains(".mac")
+        || lower.starts_with("mac")
+    {
+        20
+    } else if kind == AssetKind::Dmg {
+        // Bare `App.dmg` (e.g. UTM.dmg) is usually a Mac-only installer.
+        15
+    } else {
+        0
+    };
+
+    // Intel-only builds are a last resort on Apple Silicon.
+    if is_intel_only(lower) {
+        score = 1;
+    }
+
+    // Prefer the full app over brew tarballs / "mini" side builds when tied.
+    if lower.contains("homebrew") || lower.contains("-mini-") || lower.contains("_mini_") {
+        score -= 10;
+    }
+    if kind == AssetKind::Zip {
+        score += 5;
+    }
+    score
+}
+
 /// The best macOS asset of a release: `None` when there is none.
 fn pick_mac_asset(assets: &[Value]) -> Option<MacAsset> {
     let mut best: Option<(i32, MacAsset)> = None;
     for a in assets {
         let Some(name) = a["name"].as_str() else { continue };
         let lower = name.to_lowercase();
-        if lower.contains("windows")
-            || lower.contains("linux")
-            || lower.contains("sha256")
-            || lower.contains("checksum")
-            || lower.ends_with(".txt")
-            || lower.ends_with(".json")
-            || lower.ends_with(".sig")
-            || lower.ends_with(".exe")
-            || lower.ends_with(".part")
-        {
-            continue;
-        }
         let kind = if lower.ends_with(".zip") {
             AssetKind::Zip
         } else if lower.ends_with(".dmg") {
@@ -168,17 +232,9 @@ fn pick_mac_asset(assets: &[Value]) -> Option<MacAsset> {
         } else {
             continue;
         };
-        let mut score = if lower.contains("arm64") && !lower.contains("x86_64") {
-            40
-        } else if lower.contains("universal") {
-            30
-        } else if lower.contains("macos") || lower.contains("mac") {
-            20
-        } else {
-            0
-        };
-        if kind == AssetKind::Zip {
-            score += 5;
+        let score = score_mac_asset(&lower, kind);
+        if score < 0 {
+            continue;
         }
         let browser_url = a["browser_download_url"].as_str().unwrap_or_default();
         if browser_url.is_empty() {
@@ -204,6 +260,25 @@ fn pick_mac_asset(assets: &[Value]) -> Option<MacAsset> {
         }
     }
     best.map(|(_, a)| a)
+}
+
+/// Among releases that have a Mac asset, pick the newest *versioned* one.
+/// Unversioned side tags (e.g. `antigravity-manager`) lose to `v5.0.4`.
+fn pick_latest_release(candidates: Vec<ReleaseInfo>) -> Option<ReleaseInfo> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let versioned = candidates
+        .iter()
+        .filter_map(|info| {
+            crate::version::parse_version(&info.tag).map(|ver| (ver, info))
+        })
+        .max_by(|(a, _), (b, _)| a.cmp(b));
+    if let Some((_, info)) = versioned {
+        return Some(info.clone());
+    }
+    // Nothing parseable: keep GitHub's newest-first order.
+    candidates.into_iter().next()
 }
 
 enum ReleasesRaw {
@@ -281,20 +356,23 @@ pub fn fetch_latest_release(
     etag: Option<&str>,
     token: Option<&str>,
 ) -> Result<ReleaseFetch, String> {
-    match releases_json(slug, 15, etag, token)? {
+    // 30: busy repos interleave many prereleases / side tags before the
+    // real versioned macOS build (see Antigravity-Manager).
+    match releases_json(slug, 30, etag, token)? {
         ReleasesRaw::NotModified => Ok(ReleaseFetch::NotModified),
         ReleasesRaw::Data(arr, new_etag) => {
-            for rel in &arr {
-                if let Some(info) = release_from_json(rel, include_pre) {
-                    if info.asset.is_some() {
-                        return Ok(ReleaseFetch::Fresh {
-                            info,
-                            etag: new_etag,
-                        });
-                    }
-                }
-            }
-            Err("最新的发布里没有 macOS 安装包".to_string())
+            let candidates: Vec<ReleaseInfo> = arr
+                .iter()
+                .filter_map(|rel| release_from_json(rel, include_pre))
+                .filter(|info| info.asset.is_some())
+                .collect();
+            let Some(info) = pick_latest_release(candidates) else {
+                return Err("最新的发布里没有 macOS 安装包".to_string());
+            };
+            Ok(ReleaseFetch::Fresh {
+                info,
+                etag: new_etag,
+            })
         }
     }
 }
@@ -444,4 +522,129 @@ fn download_one(
         return Err("下载不完整".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn asset(name: &str) -> Value {
+        json!({
+            "name": name,
+            "url": format!("https://api.example/{name}"),
+            "browser_download_url": format!("https://example/{name}"),
+            "size": 1u64,
+        })
+    }
+
+    #[test]
+    fn picks_aarch64_over_x64() {
+        let assets = vec![
+            asset("HotDownloader_2.2.0_x64.dmg"),
+            asset("HotDownloader_2.2.0_aarch64.dmg"),
+        ];
+        let picked = pick_mac_asset(&assets).unwrap();
+        assert_eq!(picked.name, "HotDownloader_2.2.0_aarch64.dmg");
+    }
+
+    #[test]
+    fn picks_arm64_macos_dmg() {
+        let assets = vec![
+            asset("App-windows-x64.exe"),
+            asset("App-macos-x86_64.dmg"),
+            asset("App-macos-arm64.dmg"),
+        ];
+        let picked = pick_mac_asset(&assets).unwrap();
+        assert_eq!(picked.name, "App-macos-arm64.dmg");
+    }
+
+    #[test]
+    fn bare_dmg_still_counts() {
+        let assets = vec![asset("UTM.dmg"), asset("UTM.ipa")];
+        let picked = pick_mac_asset(&assets).unwrap();
+        assert_eq!(picked.name, "UTM.dmg");
+    }
+
+    #[test]
+    fn latest_prefers_versioned_tag() {
+        let candidates = vec![
+            ReleaseInfo {
+                tag: "antigravity-manager".into(),
+                published: "2026-11-26T07:54:38Z".into(),
+                html_url: String::new(),
+                body: String::new(),
+                asset: Some(MacAsset {
+                    name: "Antigravity.Manager_0.0.3_universal.dmg".into(),
+                    url: String::new(),
+                    browser_url: String::new(),
+                    size: 1,
+                    kind: AssetKind::Dmg,
+                }),
+            },
+            ReleaseInfo {
+                tag: "v5.0.4".into(),
+                published: "2026-11-20T16:25:01Z".into(),
+                html_url: String::new(),
+                body: String::new(),
+                asset: Some(MacAsset {
+                    name: "Antigravity.Tools_5.0.4_aarch64.dmg".into(),
+                    url: String::new(),
+                    browser_url: String::new(),
+                    size: 1,
+                    kind: AssetKind::Dmg,
+                }),
+            },
+            ReleaseInfo {
+                tag: "am-v0.0.3".into(),
+                published: "2026-11-26T10:27:28Z".into(),
+                html_url: String::new(),
+                body: String::new(),
+                asset: Some(MacAsset {
+                    name: "Antigravity.Manager_0.0.3_aarch64.dmg".into(),
+                    url: String::new(),
+                    browser_url: String::new(),
+                    size: 1,
+                    kind: AssetKind::Dmg,
+                }),
+            },
+        ];
+        let best = pick_latest_release(candidates).unwrap();
+        assert_eq!(best.tag, "v5.0.4");
+        assert!(best.asset.unwrap().name.contains("Tools"));
+    }
+
+    #[test]
+    fn latest_prefers_newer_prerelease_core() {
+        let candidates = vec![
+            ReleaseInfo {
+                tag: "v5.0.5-beta.5".into(),
+                published: String::new(),
+                html_url: String::new(),
+                body: String::new(),
+                asset: Some(MacAsset {
+                    name: "Tools_aarch64.dmg".into(),
+                    url: String::new(),
+                    browser_url: String::new(),
+                    size: 1,
+                    kind: AssetKind::Dmg,
+                }),
+            },
+            ReleaseInfo {
+                tag: "v5.0.4".into(),
+                published: String::new(),
+                html_url: String::new(),
+                body: String::new(),
+                asset: Some(MacAsset {
+                    name: "Tools_5.0.4_aarch64.dmg".into(),
+                    url: String::new(),
+                    browser_url: String::new(),
+                    size: 1,
+                    kind: AssetKind::Dmg,
+                }),
+            },
+        ];
+        let best = pick_latest_release(candidates).unwrap();
+        assert_eq!(best.tag, "v5.0.5-beta.5");
+    }
 }
